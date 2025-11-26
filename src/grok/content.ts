@@ -1708,21 +1708,73 @@ function updateInputWithMemories() {
   const inputElement = getTextarea();
 
   if (inputElement && allMemories.length > 0) {
-    // Get the content without any existing memory wrappers
-    const baseContent = getContentWithoutMemories();
+    const currentContent = inputElement.value || '';
+    const headerText = REMEMBERME_PROMPTS.memory_header_text;
+    const headerExists = currentContent.includes(headerText);
 
-    // Create the memory string with all collected memories
-    let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
-    // Add all memories to the content
-    allMemories.forEach((mem, index) => {
-      memoriesContent += `- ${mem}`;
-      if (index < allMemories.length - 1) {
-        memoriesContent += '\n';
+    if (headerExists) {
+      // Header exists - extract existing memories (following Claude's pattern)
+      const memoryMarker = '\n\n' + headerText + '\n';
+      const memoryIndex = currentContent.indexOf(memoryMarker);
+      
+      if (memoryIndex >= 0) {
+        const beforeMemories = currentContent.substring(0, memoryIndex).trim();
+        const afterMemories = currentContent.substring(memoryIndex + memoryMarker.length);
+        
+        // Extract existing memory lines (following Claude's pattern: parse and collect)
+        const existingMemories: string[] = [];
+        const lines = afterMemories.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('-')) {
+            const memText = trimmed.substring(1).trim();
+            // Avoid duplicates (Claude's pattern)
+            if (memText && !existingMemories.includes(memText)) {
+              existingMemories.push(memText);
+            }
+          } else if (trimmed && !trimmed.startsWith('-')) {
+            // Stop at first non-memory line
+            break;
+          }
+        }
+
+        // Combine existing and new memories, avoiding duplicates (Claude's pattern)
+        const combinedMemories = [...existingMemories];
+        allMemories.forEach(mem => {
+          const memStr = (mem || '').toString();
+          if (!combinedMemories.includes(memStr)) {
+            combinedMemories.push(memStr);
+          }
+        });
+
+        // Rebuild content with header + combined memories
+        let memoriesContent = '\n\n' + headerText + '\n';
+        combinedMemories.forEach((mem, index) => {
+          memoriesContent += `- ${mem}`;
+          if (index < combinedMemories.length - 1) {
+            memoriesContent += '\n';
+          }
+        });
+
+        setInputValue(inputElement, beforeMemories + memoriesContent);
       }
-    });
+    } else {
+      // Header doesn't exist - add header + memories (existing logic)
+      const baseContent = getContentWithoutMemories();
 
-    // Add the final content to the input
-    setInputValue(inputElement, baseContent + memoriesContent);
+      // Create the memory string with all collected memories
+      let memoriesContent = '\n\n' + headerText + '\n';
+      // Add all memories to the content
+      allMemories.forEach((mem, index) => {
+        memoriesContent += `- ${mem}`;
+        if (index < allMemories.length - 1) {
+          memoriesContent += '\n';
+        }
+      });
+
+      // Add the final content to the input
+      setInputValue(inputElement, baseContent + memoriesContent);
+    }
   }
 }
 

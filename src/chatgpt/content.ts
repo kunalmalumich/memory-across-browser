@@ -1065,37 +1065,115 @@ function updateInputWithMemories(): void {
     document.querySelector('textarea');
 
   if (inputElement && allMemories.length > 0) {
-    // Get the content without any existing memory wrappers
-    const baseContent = getContentWithoutMemories();
+    const headerText = REMEMBERME_PROMPTS.memory_header_text;
+    
+    // Check if header already exists (following Claude's pattern)
+    const wrapper = document.getElementById('rememberme-wrapper');
+    const headerExists = wrapper !== null || 
+      (inputElement.innerHTML && inputElement.innerHTML.includes(headerText));
 
-    // Create the memory wrapper with all collected memories
-    let memoriesContent =
-      '<div id="rememberme-wrapper" contenteditable="false" style="background-color: rgb(220, 252, 231); padding: 8px; border-radius: 4px; margin-top: 8px; margin-bottom: 8px;">';
-    memoriesContent += REMEMBERME_PROMPTS.memory_header_html_strong;
-
-    // Add all memories to the content
-    allMemories.forEach((mem, idx) => {
-      const safe = (mem || '').toString();
-      memoriesContent += `<div data-rememberme-idx="${idx}" style="user-select: text;">- ${safe}</div>`;
-    });
-    memoriesContent += '</div>';
-
-    // Add the final content to the input
-    if (inputElement.tagName.toLowerCase() === 'div') {
-      inputElement.innerHTML = `${baseContent}<div><br></div>${memoriesContent}`;
-    } else {
-      (inputElement as HTMLTextAreaElement).value = `${baseContent}\n${memoriesContent}`;
-    }
-
-    // Make only the wrapper non-editable; allow user to select/copy text inside
-    try {
-      const wrapper = document.getElementById('rememberme-wrapper');
+    if (headerExists) {
+      // Header exists - extract existing memories using DOM queries (Claude's pattern)
+      const existingMemories: string[] = [];
+      
       if (wrapper) {
-        wrapper.setAttribute('contenteditable', 'false');
-        wrapper.style.userSelect = 'text';
+        // Extract from wrapper div (ChatGPT's structure)
+        const memoryDivs = wrapper.querySelectorAll('div[data-rememberme-idx]');
+        memoryDivs.forEach(div => {
+          const text = div.textContent?.replace(/^-\s*/, '').trim();
+          if (text) existingMemories.push(text);
+        });
+      } else {
+        // Fallback: parse from innerHTML if wrapper not found (following Claude's pattern)
+        const htmlContent = inputElement.innerHTML || '';
+        if (htmlContent.includes(headerText)) {
+          const htmlParts = htmlContent.split(headerText);
+          if (htmlParts.length > 1) {
+            const afterHeader = htmlParts[1];
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = afterHeader || '';
+            
+            // Find all divs or elements that contain memory content
+            Array.from(tempDiv.querySelectorAll('div[data-rememberme-idx], div')).forEach(el => {
+              const text = (el.textContent || '').trim();
+              if (text.startsWith('-')) {
+                const memText = text.substring(1).trim();
+                if (memText && !existingMemories.includes(memText)) {
+                  existingMemories.push(memText);
+                }
+              }
+            });
+          }
+        }
       }
-    } catch {
-      // Ignore errors when setting contenteditable
+
+      // Combine existing and new memories, avoiding duplicates (Claude's pattern)
+      const combinedMemories = [...existingMemories];
+      allMemories.forEach(mem => {
+        const memStr = (mem || '').toString();
+        if (!combinedMemories.includes(memStr)) {
+          combinedMemories.push(memStr);
+        }
+      });
+
+      // Rebuild memory section
+      if (wrapper) {
+        // Update wrapper content (keep header, update memories)
+        let memoriesContent = '';
+        combinedMemories.forEach((mem, idx) => {
+          memoriesContent += `<div data-rememberme-idx="${idx}" style="user-select: text;">- ${mem}</div>`;
+        });
+        wrapper.innerHTML = REMEMBERME_PROMPTS.memory_header_html_strong + memoriesContent;
+      } else {
+        // Rebuild entire section if wrapper doesn't exist
+        const baseContent = getContentWithoutMemories();
+        let memoriesContent =
+          '<div id="rememberme-wrapper" contenteditable="false" style="background-color: rgb(220, 252, 231); padding: 8px; border-radius: 4px; margin-top: 8px; margin-bottom: 8px;">';
+        memoriesContent += REMEMBERME_PROMPTS.memory_header_html_strong;
+        combinedMemories.forEach((mem, idx) => {
+          memoriesContent += `<div data-rememberme-idx="${idx}" style="user-select: text;">- ${mem}</div>`;
+        });
+        memoriesContent += '</div>';
+        
+        if (inputElement.tagName.toLowerCase() === 'div') {
+          inputElement.innerHTML = `${baseContent}<div><br></div>${memoriesContent}`;
+        } else {
+          (inputElement as HTMLTextAreaElement).value = `${baseContent}\n${memoriesContent}`;
+        }
+      }
+    } else {
+      // Header doesn't exist - add header + memories (existing logic)
+      const baseContent = getContentWithoutMemories();
+
+      // Create the memory wrapper with all collected memories
+      let memoriesContent =
+        '<div id="rememberme-wrapper" contenteditable="false" style="background-color: rgb(220, 252, 231); padding: 8px; border-radius: 4px; margin-top: 8px; margin-bottom: 8px;">';
+      memoriesContent += REMEMBERME_PROMPTS.memory_header_html_strong;
+
+      // Add all memories to the content
+      allMemories.forEach((mem, idx) => {
+        const safe = (mem || '').toString();
+        memoriesContent += `<div data-rememberme-idx="${idx}" style="user-select: text;">- ${safe}</div>`;
+      });
+      memoriesContent += '</div>';
+
+      // Add the final content to the input
+      if (inputElement.tagName.toLowerCase() === 'div') {
+        inputElement.innerHTML = `${baseContent}<div><br></div>${memoriesContent}`;
+      } else {
+        (inputElement as HTMLTextAreaElement).value = `${baseContent}\n${memoriesContent}`;
+      }
+
+      // Make only the wrapper non-editable; allow user to select/copy text inside
+      try {
+        const newWrapper = document.getElementById('rememberme-wrapper');
+        if (newWrapper) {
+          newWrapper.setAttribute('contenteditable', 'false');
+          newWrapper.style.userSelect = 'text';
+        }
+      } catch {
+        // Ignore errors when setting contenteditable
+      }
     }
 
     inputElement.dispatchEvent(new Event('input', { bubbles: true }));

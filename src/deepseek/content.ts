@@ -2046,20 +2046,71 @@ function updateInputWithMemories(): void {
   const inputElement = getInputElement();
 
   if (inputElement && allMemories.length > 0) {
-    // Get the content without any existing memory wrappers
-    const baseContent = getContentWithoutMemories();
+    const currentContent = getInputElementValue() || '';
+    const headerText = REMEMBERME_PROMPTS.memory_header_text;
+    const headerExists = currentContent.includes(headerText);
 
-    // Create the memory wrapper with all collected memories
-    let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
-    // Add all memories to the content
-    allMemories.forEach(mem => {
-      memoriesContent += `- ${mem}\n`;
-    });
+    if (headerExists) {
+      // Header exists - extract existing memories (following Claude's pattern)
+      const memoryMarker = '\n\n' + headerText + '\n';
+      const memoryIndex = currentContent.indexOf(memoryMarker);
+      
+      if (memoryIndex >= 0) {
+        const beforeMemories = currentContent.substring(0, memoryIndex).trim();
+        const afterMemories = currentContent.substring(memoryIndex + memoryMarker.length);
+        
+        // Extract existing memory lines (following Claude's pattern: parse and collect)
+        const existingMemories: string[] = [];
+        const lines = afterMemories.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('-')) {
+            const memText = trimmed.substring(1).trim();
+            // Avoid duplicates (Claude's pattern)
+            if (memText && !existingMemories.includes(memText)) {
+              existingMemories.push(memText);
+            }
+          } else if (trimmed && !trimmed.startsWith('-')) {
+            // Stop at first non-memory line
+            break;
+          }
+        }
 
-    // Add the final content to the input
-    (inputElement as HTMLTextAreaElement).value = `${baseContent}${memoriesContent}`;
-    (inputElement as HTMLElement).dispatchEvent(new Event('input', { bubbles: true }));
-    (inputElement as HTMLElement).focus();
+        // Combine existing and new memories, avoiding duplicates (Claude's pattern)
+        const combinedMemories = [...existingMemories];
+        allMemories.forEach(mem => {
+          const memStr = (mem || '').toString();
+          if (!combinedMemories.includes(memStr)) {
+            combinedMemories.push(memStr);
+          }
+        });
+
+        // Rebuild content with header + combined memories
+        let memoriesContent = '\n\n' + headerText + '\n';
+        combinedMemories.forEach(mem => {
+          memoriesContent += `- ${mem}\n`;
+        });
+
+        (inputElement as HTMLTextAreaElement).value = beforeMemories + memoriesContent;
+        (inputElement as HTMLElement).dispatchEvent(new Event('input', { bubbles: true }));
+        (inputElement as HTMLElement).focus();
+      }
+    } else {
+      // Header doesn't exist - add header + memories (existing logic)
+      const baseContent = getContentWithoutMemories();
+
+      // Create the memory wrapper with all collected memories
+      let memoriesContent = '\n\n' + headerText + '\n';
+      // Add all memories to the content
+      allMemories.forEach(mem => {
+        memoriesContent += `- ${mem}\n`;
+      });
+
+      // Add the final content to the input
+      (inputElement as HTMLTextAreaElement).value = `${baseContent}${memoriesContent}`;
+      (inputElement as HTMLElement).dispatchEvent(new Event('input', { bubbles: true }));
+      (inputElement as HTMLElement).focus();
+    }
   }
 }
 

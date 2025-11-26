@@ -2007,27 +2007,81 @@ function updateInputWithMemories() {
     return;
   }
 
-  // First, remove any existing memory content from the input
-  let currentContent = getInputText(inputElement);
+  const currentContent = getInputText(inputElement);
+  const headerText = REMEMBERME_PROMPTS.memory_header_text;
   const memoryMarker = '\n\n' + REMEMBERME_PROMPTS.memory_marker_prefix;
+  const headerExists = currentContent.includes(headerText) || currentContent.includes(memoryMarker);
 
-  if (currentContent.includes(memoryMarker)) {
-    currentContent = currentContent.substring(0, currentContent.indexOf(memoryMarker)).trim();
-  }
+  if (headerExists) {
+    // Header exists - extract existing memories (following Claude's pattern)
+    // Find where memories start
+    const markerIndex = currentContent.indexOf(memoryMarker);
+    const headerIndex = currentContent.indexOf('\n\n' + headerText + '\n');
+    const memoryStartIndex = markerIndex >= 0 ? markerIndex : (headerIndex >= 0 ? headerIndex : -1);
+    
+    if (memoryStartIndex >= 0) {
+      const beforeMemories = currentContent.substring(0, memoryStartIndex).trim();
+      const afterMarker = currentContent.substring(memoryStartIndex + (markerIndex >= 0 ? memoryMarker.length : ('\n\n' + headerText + '\n').length));
+      
+      // Extract existing memory lines (following Claude's pattern: parse and collect)
+      const existingMemories: string[] = [];
+      const lines = afterMarker.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('-')) {
+          const memText = trimmed.substring(1).trim();
+          // Avoid duplicates (Claude's pattern)
+          if (memText && !existingMemories.includes(memText)) {
+            existingMemories.push(memText);
+          }
+        } else if (trimmed && !trimmed.startsWith('-')) {
+          // Stop at first non-memory line
+          break;
+        }
+      }
 
-  // Create the memory content string
-  let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
+      // Combine existing and new memories, avoiding duplicates (Claude's pattern)
+      const combinedMemories = [...existingMemories];
+      allMemories.forEach(mem => {
+        const memStr = (mem || '').toString();
+        if (!combinedMemories.includes(memStr)) {
+          combinedMemories.push(memStr);
+        }
+      });
 
-  // Add all memories to the content
-  allMemories.forEach((mem, index) => {
-    memoriesContent += `- ${mem}`;
-    if (index < allMemories.length - 1) {
-      memoriesContent += '\n';
+      // Rebuild content with header + combined memories
+      let memoriesContent = '\n\n' + headerText + '\n';
+      combinedMemories.forEach((mem, index) => {
+        memoriesContent += `- ${mem}`;
+        if (index < combinedMemories.length - 1) {
+          memoriesContent += '\n';
+        }
+      });
+
+      setInputValue(inputElement, beforeMemories + memoriesContent);
     }
-  });
+  } else {
+    // Header doesn't exist - add header + memories (existing logic)
+    // First, remove any existing memory content from the input
+    let baseContent = currentContent;
+    if (baseContent.includes(memoryMarker)) {
+      baseContent = baseContent.substring(0, baseContent.indexOf(memoryMarker)).trim();
+    }
 
-  // Set the input value with the cleaned content + memories
-  setInputValue(inputElement, currentContent + memoriesContent);
+    // Create the memory content string
+    let memoriesContent = '\n\n' + headerText + '\n';
+
+    // Add all memories to the content
+    allMemories.forEach((mem, index) => {
+      memoriesContent += `- ${mem}`;
+      if (index < allMemories.length - 1) {
+        memoriesContent += '\n';
+      }
+    });
+
+    // Set the input value with the cleaned content + memories
+    setInputValue(inputElement, baseContent + memoriesContent);
+  }
 }
 
 // Add a function to get the memory_enabled state
