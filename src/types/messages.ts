@@ -15,7 +15,7 @@ export enum MessageType {
 export enum SidebarAction {
   TOGGLE_SIDEBAR = 'toggleSidebar',
   OPEN_POPUP = 'openPopup',
-  TOGGLE_MEM0 = 'toggleMem0',
+  TOGGLE_REMEMBERME = 'toggleMem0',
   OPEN_DASHBOARD = 'openDashboard',
   SIDEBAR_SETTINGS = 'toggleSidebarSettings',
   OPEN_OPTIONS = 'openOptions',
@@ -65,7 +65,7 @@ export type OpenPopupMessage = {
 };
 
 export type ToggleMem0Message = {
-  action: SidebarAction.TOGGLE_MEM0;
+  action: SidebarAction.TOGGLE_REMEMBERME;
   enabled: boolean;
 };
 

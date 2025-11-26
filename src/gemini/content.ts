@@ -3,15 +3,31 @@ import type { ExtendedElement, MutableMutationObserver } from '../types/dom';
 import type { MemorySearchItem, OptionalApiParams } from '../types/memory';
 import { SidebarAction } from '../types/messages';
 import { type StorageData, StorageKey } from '../types/storage';
-import { createOrchestrator, type SearchStorage } from '../utils/background_search';
-import { OPENMEMORY_PROMPTS } from '../utils/llm_prompts';
+import { REMEMBERME_PROMPTS } from '../utils/llm_prompts';
 import { SITE_CONFIG } from '../utils/site_config';
-import { getBrowser, sendExtensionEvent } from '../utils/util_functions';
-import { OPENMEMORY_UI, type Placement } from '../utils/util_positioning';
+import {
+  getBrowser,
+  sendExtensionEvent,
+  hasValidAuth,
+  getOrgId,
+  getProjectId,
+  getApiKey,
+} from '../utils/util_functions';
+import {
+  createPlatformSearchOrchestrator,
+  setupBackgroundSearchHook,
+  addMemoryToMem0,
+  type PlatformConfig,
+} from '../utils/content_script_common';
+import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
 export {};
 
-let isProcessingMem0 = false;
+console.log('[Gemini] Content script loaded at:', new Date().toISOString());
+console.log('[Gemini] Document ready state:', document.readyState);
+console.log('[Gemini] Current URL:', window.location.href);
+
+let isProcessingRememberMe = false;
 
 let memoryModalShown: boolean = false;
 
@@ -39,123 +55,37 @@ let elementDetectionInterval: number | null = null;
 let lastFoundTextarea: HTMLElement | null = null;
 let lastFoundSendButton: HTMLButtonElement | null = null;
 
-const geminiSearch = createOrchestrator({
-  fetch: async function (query: string, opts: { signal?: AbortSignal }) {
-    const data = await new Promise<SearchStorage>(resolve => {
-      chrome.storage.sync.get(
-        [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
-          StorageKey.SIMILARITY_THRESHOLD,
-          StorageKey.TOP_K,
-        ],
-        function (items) {
-          resolve(items as SearchStorage);
-        }
-      );
-    });
-
-    const apiKey = data[StorageKey.API_KEY];
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    if (!apiKey && !accessToken) {
-      return [];
-    }
-
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
-    const userId =
-      data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
-    const threshold =
-      data[StorageKey.SIMILARITY_THRESHOLD] !== undefined
-        ? data[StorageKey.SIMILARITY_THRESHOLD]
-        : 0.1;
-    const topK = data[StorageKey.TOP_K] !== undefined ? data[StorageKey.TOP_K] : 10;
-
-    const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
-    }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
-    }
-
-    const payload = {
-      query,
-      filters: { user_id: userId },
-      rerank: true,
-      threshold: threshold,
-      top_k: topK,
-      filter_memories: false,
-      source: 'OPENMEMORY_CHROME_EXTENSION',
-      ...optionalParams,
-    };
-
-    const res = await fetch('https://api.mem0.ai/v2/memories/search/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: authHeader,
-      },
-      body: JSON.stringify(payload),
-      signal: opts && opts.signal,
-    });
-
-    if (!res.ok) {
-      throw new Error(`API request failed with status ${res.status}`);
-    }
-    return await res.json();
+// Platform configuration
+const geminiConfig: PlatformConfig = {
+  provider: 'Gemini',
+  inputSelectors: [
+    'rich-textarea .ql-editor[contenteditable="true"]',
+    'rich-textarea .ql-editor.textarea',
+    '.ql-editor[aria-label="Enter a prompt here"]',
+    '.ql-editor.textarea.new-input-ui',
+    '.text-input-field_textarea .ql-editor',
+    'div[contenteditable="true"][role="textbox"][aria-label="Enter a prompt here"]',
+  ],
+  sendButtonSelectors: [],
+  backgroundSearchHookAttribute: 'geminiBackgroundHooked',
+  getInputValue: (element: HTMLElement | null) => {
+    if (!element) return '';
+    return (element.textContent || element.innerText || '').trim();
   },
-
-  // Don’t render on prefetch. When modal is open, update it.
-  onSuccess: function (normQuery: string, responseData: MemorySearchItem[]) {
-    if (!memoryModalShown) {
-      return;
-    }
-    const memoryItems = ((responseData as MemorySearchItem[]) || []).map(
-      (item: MemorySearchItem) => ({
-        id: String(item.id),
-        text: item.memory,
-        categories: item.categories || [],
-      })
-    );
-    createMemoryModal(memoryItems, false);
+  getContentWithoutMemories: () => {
+    return getContentWithoutMemories();
   },
-
-  onError: function () {
-    if (memoryModalShown) {
-      createMemoryModal([], false);
-    }
+  createMemoryModal: (items, isLoading, sourceButtonId) => {
+    createMemoryModal(items, isLoading);
   },
+  onMemoryModalShown: (shown) => {
+    memoryModalShown = shown;
+  },
+  logPrefix: 'Gemini',
+};
 
-  minLength: 3,
-  debounceMs: 75,
-  cacheTTL: 60000,
-});
-
-let geminiBackgroundSearchHandler: (() => void) | null = null;
-function hookGeminiBackgroundSearchTyping() {
-  const textarea = getTextarea();
-  if (!textarea) {
-    return;
-  }
-
-  if (textarea.dataset.geminiBackgroundHooked) {
-    return;
-  }
-  textarea.dataset.geminiBackgroundHooked = 'true';
-
-  if (!geminiBackgroundSearchHandler) {
-    geminiBackgroundSearchHandler = function () {
-      const text = (textarea.textContent || textarea.innerText || '').trim();
-      (geminiSearch as { setText: (text: string) => void }).setText(text);
-    };
-  }
-  textarea.addEventListener('input', geminiBackgroundSearchHandler);
-  textarea.addEventListener('keyup', geminiBackgroundSearchHandler);
-}
+const geminiSearch = createPlatformSearchOrchestrator(geminiConfig);
+const hookGeminiBackgroundSearchTyping = setupBackgroundSearchHook(geminiConfig, geminiSearch);
 
 function getTextarea(): HTMLElement | null {
   const selectors = [
@@ -174,7 +104,7 @@ function getTextarea(): HTMLElement | null {
       if (lastFoundTextarea !== textarea) {
         lastFoundTextarea = textarea;
         // Reset listener flag when new textarea is found
-        if (textarea.dataset.mem0KeyListener !== 'true') {
+        if (textarea.dataset.remembermeKeyListener !== 'true') {
           sendListenerAdded = false;
         }
       }
@@ -211,7 +141,7 @@ function getSendButton(): HTMLButtonElement | null {
       if (lastFoundSendButton !== button) {
         lastFoundSendButton = button;
         // Reset listener flag when new button is found
-        if (button.dataset.mem0Listener !== 'true') {
+        if (button.dataset.remembermeListener !== 'true') {
           sendListenerAdded = false;
         }
       }
@@ -329,7 +259,7 @@ function getContentWithoutMemories(): string {
   let content = inputElement.textContent || '';
 
   // Remove any memory headers and content
-  const memoryPrefix = OPENMEMORY_PROMPTS.memory_header_text;
+  const memoryPrefix = REMEMBERME_PROMPTS.memory_header_text;
   const prefixIndex = content.indexOf(memoryPrefix);
   if (prefixIndex !== -1) {
     content = content.substring(0, prefixIndex).trim();
@@ -337,8 +267,8 @@ function getContentWithoutMemories(): string {
 
   // Also try with regex pattern
   try {
-    const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-    content = content.replace(MEM0_PLAIN, '').trim();
+    const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+    content = content.replace(REMEMBERME_PLAIN, '').trim();
   } catch {
     // Ignore regex errors
   }
@@ -396,57 +326,7 @@ function addSendButtonListener(): void {
     }, 1000);
 
     // Asynchronously store the memory
-    chrome.storage.sync.get(
-      [
-        StorageKey.API_KEY,
-        StorageKey.USER_ID_CAMEL,
-        StorageKey.ACCESS_TOKEN,
-        StorageKey.MEMORY_ENABLED,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
-        StorageKey.USER_ID,
-      ],
-      function (items) {
-        // Skip if memory is disabled or no credentials
-        if (items.memory_enabled === false || (!items.apiKey && !items.access_token)) {
-          return;
-        }
-
-        const authHeader = items.access_token
-          ? `Bearer ${items.access_token}`
-          : `Token ${items.apiKey}`;
-
-        const userId = items.userId || items.user_id || 'chrome-extension-user';
-
-        const optionalParams: OptionalApiParams = {};
-        if (items.selected_org) {
-          optionalParams.org_id = items.selected_org;
-        }
-        if (items.selected_project) {
-          optionalParams.project_id = items.selected_project;
-        }
-        // Send memory to mem0 API asynchronously without waiting for response
-        fetch('https://api.mem0.ai/v1/memories/', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: authHeader,
-          },
-          body: JSON.stringify({
-            messages: [{ role: MessageRole.User, content: cleanMessage }],
-            user_id: userId,
-            infer: true,
-            metadata: {
-              provider: 'Gemini',
-            },
-            source: 'OPENMEMORY_CHROME_EXTENSION',
-            ...optionalParams,
-          }),
-        }).catch(() => {
-          // Ignore errors
-        });
-      }
-    );
+    addMemoryToMem0(cleanMessage, geminiConfig);
 
     // Clear all memories after sending
     setTimeout(() => {
@@ -458,8 +338,8 @@ function addSendButtonListener(): void {
   // **TIMING FIX: Use the new getSendButton function**
   const sendButton = getSendButton();
 
-  if (sendButton && !sendButton.dataset.mem0Listener) {
-    sendButton.dataset.mem0Listener = 'true';
+  if (sendButton && !sendButton.dataset.remembermeListener) {
+    sendButton.dataset.remembermeListener = 'true';
     sendButton.addEventListener('click', function () {
       captureAndStoreMemory();
     });
@@ -469,8 +349,8 @@ function addSendButtonListener(): void {
   const textarea = getTextarea();
 
   if (textarea) {
-    if (!textarea.dataset.mem0KeyListener) {
-      textarea.dataset.mem0KeyListener = 'true';
+    if (!textarea.dataset.remembermeKeyListener) {
+      textarea.dataset.remembermeKeyListener = 'true';
       textarea.addEventListener('keydown', function (event) {
         // Check if Enter was pressed without Shift (standard send behavior)
         if (event.key === 'Enter' && !event.shiftKey) {
@@ -488,12 +368,14 @@ function addSendButtonListener(): void {
   }
 }
 
+// REMOVED: Button injection code - using notification-only approach
 function injectMem0Button(): void {
-  // Prefer OPENMEMORY_UI mounts; fall back to legacy injection only if unavailable
-  if (OPENMEMORY_UI && OPENMEMORY_UI.mountOnEditorFocus) {
+  return; // Disabled - notification-only mode
+  // Prefer REMEMBERME_UI mounts; fall back to legacy injection only if unavailable
+  // if (REMEMBERME_UI && REMEMBERME_UI.mountOnEditorFocus) {
     try {
-      if (!document.getElementById('mem0-icon-button')) {
-        OPENMEMORY_UI.resolveCachedAnchor(
+      if (!document.getElementById('rememberme-icon-button')) {
+        REMEMBERME_UI.resolveCachedAnchor(
           { learnKey: location.host + ':' + location.pathname },
           null,
           24 * 60 * 60 * 1000
@@ -501,10 +383,10 @@ function injectMem0Button(): void {
           if (!hit || !hit.el) {
             return;
           }
-          let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
+          let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
           let host = hs.host,
             shadow = hs.shadow;
-          host.id = 'mem0-icon-button';
+          host.id = 'rememberme-icon-button';
           let cfg =
             typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.gemini ? SITE_CONFIG.gemini : null;
           let placement = hit.placement ||
@@ -513,25 +395,25 @@ function injectMem0Button(): void {
               where: 'beforeend' as const,
               inlineAlign: 'end' as const,
             };
-          OPENMEMORY_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
+          REMEMBERME_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
           let style = document.createElement('style');
           style.textContent = `
               :host { position: relative; }
-              .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-              .mem0-btn img { width:18px; height:18px; border-radius:50%; }
+              .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+              .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
               .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
               :host([data-has-text="1"]) .dot { display:block; }
             `;
           let btn = document.createElement('button');
-          btn.className = 'mem0-btn';
+          btn.className = 'rememberme-btn';
           let img = document.createElement('img');
-          img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
+          img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
           let dot = document.createElement('div');
           dot.className = 'dot';
           btn.appendChild(img);
           shadow.append(style, btn, dot);
           btn.addEventListener('click', function () {
-            handleMem0Modal();
+            handleRememberMeModal();
           });
           if (typeof updateNotificationDot === 'function') {
             setTimeout(updateNotificationDot, 0);
@@ -541,112 +423,114 @@ function injectMem0Button(): void {
     } catch {
       // Ignore errors during re-initialization
     }
-
-    OPENMEMORY_UI.mountOnEditorFocus({
-      existingHostSelector: '#mem0-icon-button',
-      editorSelector:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.gemini &&
-        SITE_CONFIG.gemini.editorSelector
-          ? SITE_CONFIG.gemini.editorSelector
-          : 'textarea, [contenteditable="true"], input[type="text"]',
-      deriveAnchor:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.gemini &&
-        typeof SITE_CONFIG.gemini.deriveAnchor === 'function'
-          ? SITE_CONFIG.gemini.deriveAnchor
-          : function (editor: Element) {
-              return editor.closest('form') || editor.parentElement;
-            },
-      placement:
-        typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.gemini && SITE_CONFIG.gemini.placement
-          ? SITE_CONFIG.gemini.placement
-          : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-      render: function (shadow: ShadowRoot, host: HTMLElement) {
-        host.id = 'mem0-icon-button';
-        let style = document.createElement('style');
-        style.textContent = `
-          :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-          .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-          :host([data-has-text="1"]) .dot { display:block; }
-        `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-      },
-      fallback: function () {
-        let cfg =
-          typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.gemini ? SITE_CONFIG.gemini : null;
-        return OPENMEMORY_UI.mountResilient({
-          anchors: [
-            {
-              find: function () {
-                let sel =
-                  (cfg && cfg.editorSelector) ||
-                  'textarea, [contenteditable="true"], input[type="text"]';
-                let ed = document.querySelector(sel);
-                if (!ed) {
-                  return null;
-                }
-                try {
-                  return cfg && typeof cfg.deriveAnchor === 'function'
-                    ? cfg.deriveAnchor(ed)
-                    : ed.closest('form') || ed.parentElement;
-                } catch (_) {
-                  return ed.closest('form') || ed.parentElement;
-                }
-              },
-            },
-          ],
-          placement: (cfg && cfg.placement) || {
-            strategy: 'inline',
-            where: 'beforeend',
-            inlineAlign: 'end',
-          },
-          enableFloatingFallback: true,
-          render: function (shadow: ShadowRoot, host: HTMLElement) {
-            host.id = 'mem0-icon-button';
-            let style = document.createElement('style');
-            style.textContent = `
-              :host { position: relative; }
-              .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-              .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-              .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-              :host([data-has-text="1"]) .dot { display:block; }
-            `;
-            let btn = document.createElement('button');
-            btn.className = 'mem0-btn';
-            let img = document.createElement('img');
-            img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-            let dot = document.createElement('div');
-            dot.className = 'dot';
-            btn.appendChild(img);
-            shadow.append(style, btn, dot);
-            btn.addEventListener('click', function () {
-              handleMem0Modal();
-            });
-            if (typeof updateNotificationDot === 'function') {
-              setTimeout(updateNotificationDot, 0);
-            }
-          },
-        });
-      },
-    });
-    return;
-  }
+    return; // Disabled - notification-only mode
+    // REMOVED: Button injection - using notification-only approach
+    // REMEMBERME_UI.mountOnEditorFocus({
+    //   existingHostSelector: '#rememberme-icon-button',
+//       editorSelector:
+//         typeof SITE_CONFIG !== 'undefined' &&
+//         SITE_CONFIG.gemini &&
+//         SITE_CONFIG.gemini.editorSelector
+//           ? SITE_CONFIG.gemini.editorSelector
+//           : 'textarea, [contenteditable="true"], input[type="text"]',
+//       deriveAnchor:
+//         typeof SITE_CONFIG !== 'undefined' &&
+//         SITE_CONFIG.gemini &&
+//         typeof SITE_CONFIG.gemini.deriveAnchor === 'function'
+//           ? SITE_CONFIG.gemini.deriveAnchor
+//           : function (editor: Element) {
+//               return editor.closest('form') || editor.parentElement;
+//             },
+//       placement:
+//         typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.gemini && SITE_CONFIG.gemini.placement
+//           ? SITE_CONFIG.gemini.placement
+//           : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
+//       render: function (shadow: ShadowRoot, host: HTMLElement) {
+//         host.id = 'rememberme-icon-button';
+//         let style = document.createElement('style');
+//         style.textContent = `
+//           :host { position: relative; }
+//           .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+//           .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//           :host([data-has-text="1"]) .dot { display:block; }
+//         `;
+//         let btn = document.createElement('button');
+//         btn.className = 'rememberme-btn';
+//         let img = document.createElement('img');
+//         img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//         let dot = document.createElement('div');
+//         dot.className = 'dot';
+//         btn.appendChild(img);
+//         shadow.append(style, btn, dot);
+//         btn.addEventListener('click', function () {
+//           handleRememberMeModal();
+//         });
+//         if (typeof updateNotificationDot === 'function') {
+//           setTimeout(updateNotificationDot, 0);
+//         }
+//       },
+//       fallback: function () {
+//         let cfg =
+//           typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.gemini ? SITE_CONFIG.gemini : null;
+//         return REMEMBERME_UI.mountResilient({
+//           anchors: [
+//             {
+//               find: function () {
+//                 let sel =
+//                   (cfg && cfg.editorSelector) ||
+//                   'textarea, [contenteditable="true"], input[type="text"]';
+//                 let ed = document.querySelector(sel);
+//                 if (!ed) {
+//                   return null;
+//                 }
+//                 try {
+//                   return cfg && typeof cfg.deriveAnchor === 'function'
+//                     ? cfg.deriveAnchor(ed)
+//                     : ed.closest('form') || ed.parentElement;
+//                 } catch (_) {
+//                   return ed.closest('form') || ed.parentElement;
+//                 }
+//               },
+//             },
+//           ],
+//           placement: (cfg && cfg.placement) || {
+//             strategy: 'inline',
+//             where: 'beforeend',
+//             inlineAlign: 'end',
+//           },
+//           enableFloatingFallback: true,
+//           render: function (shadow: ShadowRoot, host: HTMLElement) {
+//             host.id = 'rememberme-icon-button';
+//             let style = document.createElement('style');
+//             style.textContent = `
+//               :host { position: relative; }
+//               .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+//               .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//               .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//               :host([data-has-text="1"]) .dot { display:block; }
+//             `;
+//             let btn = document.createElement('button');
+//             btn.className = 'rememberme-btn';
+//             let img = document.createElement('img');
+//             img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//             let dot = document.createElement('div');
+//             dot.className = 'dot';
+//             btn.appendChild(img);
+//             shadow.append(style, btn, dot);
+//             btn.addEventListener('click', function () {
+//               handleRememberMeModal();
+//             });
+//             if (typeof updateNotificationDot === 'function') {
+//               setTimeout(updateNotificationDot, 0);
+//             }
+//           },
+//         });
+//       },
+//     });
+  //   return;
+  // }
+  return; // Disabled - notification-only mode
   let buttonRetryCount = 0;
   const maxButtonRetries = 10;
 
@@ -663,7 +547,7 @@ function injectMem0Button(): void {
 
     // Remove existing button if memory is disabled
     if (!memoryEnabled) {
-      const existingButton = document.querySelector('#mem0-icon-button');
+      const existingButton = document.querySelector('#rememberme-icon-button');
       if (existingButton && existingButton.parentElement) {
         existingButton.parentElement.remove();
       }
@@ -682,7 +566,7 @@ function injectMem0Button(): void {
     }
 
     // Check if our button already exists
-    if (document.querySelector('#mem0-icon-button')) {
+    if (document.querySelector('#rememberme-icon-button')) {
       // **PERFORMANCE FIX: Reset retry count on success**
       buttonRetryCount = 0;
       return;
@@ -692,23 +576,23 @@ function injectMem0Button(): void {
     buttonRetryCount = 0;
 
     // Create mem0 button container to match toolbox-drawer-item structure
-    const mem0ButtonContainer = document.createElement('toolbox-drawer-item');
-    mem0ButtonContainer.className =
+    const remembermeButtonContainer = document.createElement('toolbox-drawer-item');
+    remembermeButtonContainer.className =
       'mat-mdc-tooltip-trigger toolbox-drawer-item-button ng-tns-c1279795495-8 mat-mdc-tooltip-disabled ng-star-inserted';
-    mem0ButtonContainer.style.position = 'relative'; // For popover positioning
-    mem0ButtonContainer.style.backgroundColor = 'transparent';
-    mem0ButtonContainer.style.border = 'none';
+    remembermeButtonContainer.style.position = 'relative'; // For popover positioning
+    remembermeButtonContainer.style.backgroundColor = 'transparent';
+    remembermeButtonContainer.style.border = 'none';
 
     // Create mem0 button to match the toolbox drawer button style
-    const mem0Button = document.createElement('button');
-    mem0Button.className =
+    const remembermeButton = document.createElement('button');
+    remembermeButton.className =
       'mat-ripple mat-mdc-tooltip-trigger toolbox-drawer-item-button gds-label-l is-mobile ng-star-inserted';
-    mem0Button.setAttribute('matripple', '');
-    mem0Button.setAttribute('aria-pressed', 'false');
-    mem0Button.setAttribute('aria-label', 'Mem0');
-    mem0Button.id = 'mem0-icon-button';
-    mem0Button.style.backgroundColor = 'transparent';
-    mem0Button.style.border = 'none';
+    remembermeButton.setAttribute('matripple', '');
+    remembermeButton.setAttribute('aria-pressed', 'false');
+    remembermeButton.setAttribute('aria-label', 'Mem0');
+    remembermeButton.id = 'rememberme-icon-button';
+    remembermeButton.style.backgroundColor = 'transparent';
+    remembermeButton.style.border = 'none';
 
     // Create the button label div to match other toolbox items
     const buttonLabel = document.createElement('div');
@@ -725,7 +609,7 @@ function injectMem0Button(): void {
 
     // Create notification dot
     const notificationDot = document.createElement('div');
-    notificationDot.id = 'mem0-notification-dot';
+    notificationDot.id = 'rememberme-notification-dot';
     notificationDot.style.cssText = `
       position: absolute;
       top: -2px;
@@ -751,7 +635,7 @@ function injectMem0Button(): void {
           100% { transform: scale(1); }
         }
         
-        #mem0-notification-dot.active {
+        #rememberme-notification-dot.active {
           display: block !important;
           animation: popIn 0.3s ease-out forwards;
         }
@@ -761,7 +645,7 @@ function injectMem0Button(): void {
 
     // Add icon and text to button label
     const iconImg = document.createElement('img');
-    iconImg.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
+    iconImg.src = chrome.runtime.getURL('icons/rememberme-icon.png');
     iconImg.style.cssText = `
       width: 18px;
       height: 18px;
@@ -773,7 +657,7 @@ function injectMem0Button(): void {
 
     buttonLabel.appendChild(iconImg);
     buttonLabel.appendChild(labelText);
-    mem0Button.appendChild(buttonLabel);
+    remembermeButton.appendChild(buttonLabel);
 
     // Create popover element (hidden by default)
     const popover = document.createElement('div');
@@ -814,22 +698,22 @@ function injectMem0Button(): void {
     popover.appendChild(arrow);
 
     // Add hover event for popover
-    mem0ButtonContainer.addEventListener('mouseenter', () => {
+    remembermeButtonContainer.addEventListener('mouseenter', () => {
       popover.style.display = 'block';
       setTimeout(() => (popover.style.opacity = '1'), 10);
     });
 
-    mem0ButtonContainer.addEventListener('mouseleave', () => {
+    remembermeButtonContainer.addEventListener('mouseleave', () => {
       popover.style.opacity = '0';
       setTimeout(() => (popover.style.display = 'none'), 200);
     });
 
     // Add click event to the mem0 button to show memory modal
-    mem0Button.addEventListener('click', function () {
+    remembermeButton.addEventListener('click', function () {
       // Check if the memories are enabled
       getMemoryEnabledState().then(memoryEnabled => {
         if (memoryEnabled) {
-          handleMem0Modal();
+          handleRememberMeModal();
         } else {
           // If memories are disabled, open options
           chrome.runtime.sendMessage({ action: SidebarAction.OPEN_OPTIONS });
@@ -838,12 +722,12 @@ function injectMem0Button(): void {
     });
 
     // Assemble button components
-    mem0ButtonContainer.appendChild(mem0Button);
-    mem0ButtonContainer.appendChild(notificationDot);
-    mem0ButtonContainer.appendChild(popover);
+    remembermeButtonContainer.appendChild(remembermeButton);
+    remembermeButtonContainer.appendChild(notificationDot);
+    remembermeButtonContainer.appendChild(popover);
 
     // Insert the button into the toolbox drawer
-    toolboxDrawer.appendChild(mem0ButtonContainer);
+    toolboxDrawer.appendChild(remembermeButtonContainer);
 
     // Update notification dot based on input content
     updateNotificationDot();
@@ -859,7 +743,7 @@ function injectMem0Button(): void {
 // Function to update notification dot visibility based on text in the input
 function updateNotificationDot(): void {
   const textarea = getTextarea();
-  const notificationDot = document.querySelector('#mem0-notification-dot');
+  const notificationDot = document.querySelector('#rememberme-notification-dot');
 
   if (textarea && notificationDot) {
     // Function to check if input has text
@@ -929,7 +813,7 @@ function updateInputWithMemories(): void {
     const baseContent = getContentWithoutMemories();
 
     // Create the memory string with all collected memories
-    let memoriesContent = '\n\n' + OPENMEMORY_PROMPTS.memory_header_text + '\n';
+    let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
     // Add all memories to the content
     allMemories.forEach((mem, index) => {
       memoriesContent += `- ${mem}`;
@@ -946,13 +830,13 @@ function updateInputWithMemories(): void {
 // Function to show a small popup message near the button
 function showButtonPopup(button: HTMLElement, message: string): void {
   // Remove any existing popups
-  const existingPopup = document.querySelector('.mem0-button-popup');
+  const existingPopup = document.querySelector('.rememberme-button-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   const popup = document.createElement('div');
-  popup.className = 'mem0-button-popup';
+  popup.className = 'rememberme-button-popup';
 
   popup.style.cssText = `
     position: absolute;
@@ -1004,14 +888,14 @@ function showButtonPopup(button: HTMLElement, message: string): void {
 // Function to show login popup
 function showLoginPopup(): void {
   // First remove any existing popups
-  const existingPopup = document.querySelector('#mem0-login-popup');
+  const existingPopup = document.querySelector('#rememberme-login-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   // Create popup container
   const popupOverlay = document.createElement('div');
-  popupOverlay.id = 'mem0-login-popup';
+  popupOverlay.id = 'rememberme-login-popup';
   popupOverlay.style.cssText = `
     position: fixed;
     top: 0;
@@ -1063,7 +947,7 @@ function showLoginPopup(): void {
   `;
 
   const heading = document.createElement('h2');
-  heading.textContent = 'Sign in to OpenMemory';
+  heading.textContent = 'Sign in to RememberMe';
   heading.style.cssText = `
     margin: 0;
     font-size: 18px;
@@ -1105,7 +989,7 @@ function showLoginPopup(): void {
 
   // Add logo and text
   const logoDark = document.createElement('img');
-  logoDark.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logoDark.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logoDark.style.cssText = `
     width: 20px;
     height: 20px;
@@ -1113,7 +997,7 @@ function showLoginPopup(): void {
   `;
 
   const signInText = document.createElement('span');
-  signInText.textContent = 'Sign in with OpenMemory';
+  signInText.textContent = 'Sign in with RememberMe';
 
   signInButton.appendChild(logoDark);
   signInButton.appendChild(signInText);
@@ -1172,12 +1056,12 @@ function createMemoryModal(
   let leftPosition: number;
 
   // Position relative to the Mem0 button
-  const mem0Button =
-    (document.querySelector('#mem0-icon-button') as HTMLElement) ||
+  const remembermeButton =
+    (document.querySelector('#rememberme-icon-button') as HTMLElement) ||
     (document.querySelector('button[aria-label="Mem0"]') as HTMLElement);
 
-  if (mem0Button) {
-    const buttonRect = mem0Button.getBoundingClientRect();
+  if (remembermeButton) {
+    const buttonRect = remembermeButton.getBoundingClientRect();
 
     // Determine if there's enough space below the button
     const viewportHeight = window.innerHeight;
@@ -1275,16 +1159,16 @@ function createMemoryModal(
 
   // Add Mem0 logo
   const logoImg = document.createElement('img');
-  logoImg.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logoImg.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logoImg.style.cssText = `
     width: 26px;
     height: 26px;
     border-radius: 50%;
   `;
 
-  // Add "OpenMemory" title
+  // Add "RememberMe" title
   const title = document.createElement('div');
-  title.textContent = 'OpenMemory';
+  title.textContent = 'RememberMe';
   title.style.cssText = `
     font-size: 16px;
     font-weight: 600;
@@ -1648,7 +1532,7 @@ function createMemoryModal(
         e.stopPropagation();
         sendExtensionEvent('memory_injection', {
           provider: 'gemini',
-          source: 'OPENMEMORY_CHROME_EXTENSION',
+          source: 'REMEMBERME_CHROME_EXTENSION',
           browser: getBrowser(),
           injected_all: false,
           memory_id: memory.id,
@@ -1984,7 +1868,7 @@ function createMemoryModal(
 
     sendExtensionEvent('memory_injection', {
       provider: 'gemini',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
       injected_all: true,
       memory_count: newMemories.length,
@@ -2015,10 +1899,10 @@ function createMemoryModal(
 }
 
 // Handler for the modal approach
-async function handleMem0Modal(): Promise<void> {
+async function handleRememberMeModal(): Promise<void> {
   // Check if there are actually memories in the current prompt
   const currentPrompt = getTextarea() ? (getTextarea() as HTMLElement).textContent || '' : '';
-  const hasMemoriesInPrompt = currentPrompt.includes(OPENMEMORY_PROMPTS.memory_marker_prefix);
+  const hasMemoriesInPrompt = currentPrompt.includes(REMEMBERME_PROMPTS.memory_marker_prefix);
 
   if (!hasMemoriesInPrompt) {
     // If there are no memories in the current prompt, clear the tracking
@@ -2031,18 +1915,9 @@ async function handleMem0Modal(): Promise<void> {
     return;
   }
 
-  // Check if user is logged in
-  const loginData: StorageData = await new Promise<StorageData>(resolve => {
-    chrome.storage.sync.get(
-      [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
-      function (items) {
-        resolve(items);
-      }
-    );
-  });
-
-  // If no API key and no access token, show login popup
-  if (!loginData.apiKey && !loginData.access_token) {
+  // Check if user is logged in (Supabase or legacy)
+  const hasAuth = await hasValidAuth();
+  if (!hasAuth) {
     showLoginPopup();
     return;
   }
@@ -2053,12 +1928,12 @@ async function handleMem0Modal(): Promise<void> {
   // If no message, show a popup and return
   if (!message) {
     // Show message that requires input
-    const mem0Button =
-      (document.querySelector('#mem0-icon-button') as HTMLElement) ||
+    const remembermeButton =
+      (document.querySelector('#rememberme-icon-button') as HTMLElement) ||
       (document.querySelector('button[aria-label="Mem0"]') as HTMLElement);
 
-    if (mem0Button) {
-      showButtonPopup(mem0Button as HTMLElement, 'Please enter some text first');
+    if (remembermeButton) {
+      showButtonPopup(remembermeButton as HTMLElement, 'Please enter some text first');
     }
     return;
   }
@@ -2066,15 +1941,15 @@ async function handleMem0Modal(): Promise<void> {
   // Clean the message of any existing memory content
   message = getContentWithoutMemories();
 
-  if (isProcessingMem0) {
+  if (isProcessingRememberMe) {
     // Don't return, allow the modal to open anyway
   }
 
-  isProcessingMem0 = true;
+  isProcessingRememberMe = true;
 
   // Add a timeout to reset the flag if something goes wrong
   const timeoutId = setTimeout(() => {
-    isProcessingMem0 = false;
+    isProcessingRememberMe = false;
   }, 30000); // 30 second timeout
 
   // Show the loading modal immediately with the source button ID
@@ -2084,12 +1959,8 @@ async function handleMem0Modal(): Promise<void> {
     const data: StorageData = await new Promise<StorageData>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.SIMILARITY_THRESHOLD,
           StorageKey.TOP_K,
         ],
@@ -2099,55 +1970,57 @@ async function handleMem0Modal(): Promise<void> {
       );
     });
 
-    const apiKey = data[StorageKey.API_KEY];
-    const userId =
-      data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    // const threshold = data.similarity_threshold !== undefined ? data.similarity_threshold : 0.1;
-    // const topK = data.top_k !== undefined ? data.top_k : 10;
+    const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+    const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
 
-    if (!apiKey && !accessToken) {
-      isProcessingMem0 = false;
+    if (!supabaseAccessToken || !supabaseUserId) {
+      isProcessingRememberMe = false;
       return;
     }
 
     sendExtensionEvent('modal_clicked', {
       provider: 'gemini',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
     });
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      console.error('[Gemini] VITE_MEM0_API_KEY not configured');
+      return;
+    }
+    const authHeader = `Token ${apiKey}`;
 
     const messages = [{ role: MessageRole.User, content: message }];
 
     const optionalParams: OptionalApiParams = {};
-
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+    const orgId = getOrgId();
+    const projectId = getProjectId();
+    if (orgId) {
+      optionalParams.org_id = orgId;
     }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+    if (projectId) {
+      optionalParams.project_id = projectId;
     }
 
     (geminiSearch as { runImmediate: (message: string) => void }).runImmediate(message);
 
     // Proceed with adding memory asynchronously without awaiting
-    fetch('https://api.mem0.ai/v1/memories/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: authHeader,
-      },
-      body: JSON.stringify({
-        messages: messages,
-        user_id: userId,
-        infer: true,
-        metadata: {
-          provider: 'Gemini',
+      fetch('https://api.mem0.ai/v1/memories/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authHeader,
         },
-        source: 'OPENMEMORY_CHROME_EXTENSION',
-        ...optionalParams,
-      }),
+        body: JSON.stringify({
+          messages: messages,
+          user_id: supabaseUserId,
+          infer: true,
+          metadata: {
+            provider: 'Gemini',
+          },
+          version: 'v2',
+          ...optionalParams,
+        }),
     }).catch(() => {
       // Ignore errors
     });
@@ -2156,24 +2029,35 @@ async function handleMem0Modal(): Promise<void> {
     createMemoryModal([], false);
   } finally {
     clearTimeout(timeoutId);
-    isProcessingMem0 = false;
+    isProcessingRememberMe = false;
   }
 }
 
 function initializeMem0Integration(): void {
+  console.log('[Gemini] initializeMem0Integration called');
+  
   // **PERFORMANCE FIX: Prevent multiple initializations**
   if (isInitialized) {
+    console.log('[Gemini] Already initialized, skipping');
     return;
   }
 
   try {
     setupInputObserver();
     try {
-      hookGeminiBackgroundSearchTyping();
-    } catch {
+      console.log('[Gemini] Initializing background search hook...');
+      const hookSuccess = hookGeminiBackgroundSearchTyping();
+      if (hookSuccess) {
+        console.log('[Gemini] Background search hook initialized successfully');
+      } else {
+        console.log('[Gemini] Background search hook: input element not found, will retry...');
+      }
+    } catch (error) {
+      console.error('[Gemini] Failed to initialize background search hook:', error);
       // Ignore errors
     }
-    injectMem0Button();
+    // COMMENTED OUT: Icon button injection - using notification-only approach
+    // injectMem0Button();
     addSendButtonListener();
 
     // **TIMING FIX: Start periodic element detection**
@@ -2202,7 +2086,7 @@ function initializeMem0Integration(): void {
         const targetEl = mutation.target as Element;
         if (
           targetEl &&
-          ((targetEl as ExtendedElement).id === 'mem0-notification-dot' ||
+          ((targetEl as ExtendedElement).id === 'rememberme-notification-dot' ||
             targetEl.classList?.contains('mem0-button-popover') ||
             targetEl.classList?.contains('toolbox-drawer-item') ||
             (targetEl as ExtendedElement).querySelector?.('[aria-label="Mem0"]'))
@@ -2249,17 +2133,26 @@ function initializeMem0Integration(): void {
             // Check memory state first
             const memoryEnabled = await getMemoryEnabledState();
 
+            // REMOVED: Button injection - using notification-only approach
             // Only inject the button if memory is enabled
             if (memoryEnabled) {
-              if (!document.querySelector('#mem0-icon-button')) {
-                injectMem0Button();
+              // if (!document.querySelector('#rememberme-icon-button')) {
+              //   injectMem0Button();
+              // }
+              // Retry background search hook if not already attached
+              let inputElement: HTMLElement | null = null;
+              for (const selector of geminiConfig.inputSelectors) {
+                inputElement = document.querySelector(selector);
+                if (inputElement) break;
+              }
+              if (inputElement && !(inputElement as any).dataset[geminiConfig.backgroundSearchHookAttribute]) {
+                hookGeminiBackgroundSearchTyping();
               }
               if (!sendListenerAdded) {
                 addSendButtonListener();
               }
-              updateNotificationDot();
             } else {
-              const host = document.querySelector('#mem0-icon-button') as HTMLElement | null;
+              const host = document.querySelector('#rememberme-icon-button') as HTMLElement | null;
               if (host && host.parentElement) {
                 host.parentElement.remove();
               }
@@ -2298,7 +2191,7 @@ function initializeMem0Integration(): void {
       if (event.ctrlKey && event.key === 'm') {
         event.preventDefault();
         (async () => {
-          await handleMem0Modal();
+          await handleRememberMeModal();
         })();
       }
     });
@@ -2315,12 +2208,13 @@ function initializeMem0Integration(): void {
       try {
         const memoryEnabled = await getMemoryEnabledState();
         if (!memoryEnabled) {
-          const existingButton = document.querySelector('#mem0-icon-button');
+          const existingButton = document.querySelector('#rememberme-icon-button');
           if (existingButton && existingButton.parentElement) {
             existingButton.parentElement.remove();
           }
-        } else if (!document.querySelector('#mem0-icon-button')) {
-          injectMem0Button();
+        } else if (!document.querySelector('#rememberme-icon-button')) {
+          // REMOVED: Button injection - using notification-only approach
+          // injectMem0Button();
         }
       } catch {
         // Ignore errors
@@ -2374,4 +2268,12 @@ function cleanup(): void {
 window.addEventListener('beforeunload', cleanup);
 
 // Initialize the integration when the page loads
-initializeMem0Integration();
+console.log('[Gemini] About to call initializeMem0Integration, function exists:', typeof initializeMem0Integration);
+
+try {
+  console.log('[Gemini] Starting initialization...');
+  initializeMem0Integration();
+} catch (error) {
+  console.error('[Gemini] Fatal error during initialization:', error);
+  console.error('[Gemini] Error stack:', (error as Error).stack);
+}

@@ -1,6 +1,6 @@
-export const OPENMEMORY_PROMPTS = {
+export const REMEMBERME_PROMPTS = {
   rerank_system_prompt: `
-You are OpenMemory Filterer.
+You are RememberMe Filterer.
 
 Your tasks:
 1) From the provided candidate memories, select ONLY those that materially help answer the user query.

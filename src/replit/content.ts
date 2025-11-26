@@ -6,10 +6,20 @@ import type { MemoryItem, MemorySearchItem, OptionalApiParams } from '../types/m
 import { SidebarAction } from '../types/messages';
 import { type StorageItems, StorageKey } from '../types/storage';
 import { createOrchestrator, type SearchStorage } from '../utils/background_search';
-import { OPENMEMORY_PROMPTS } from '../utils/llm_prompts';
+import { REMEMBERME_PROMPTS } from '../utils/llm_prompts';
 import { SITE_CONFIG } from '../utils/site_config';
-import { getBrowser, sendExtensionEvent } from '../utils/util_functions';
-import { OPENMEMORY_UI, type Placement } from '../utils/util_positioning';
+import {
+  getBrowser,
+  shouldTriggerMemorySearch,
+  sendExtensionEvent,
+  showMemoryNotification,
+  buildSearchFilters,
+  hasValidAuth,
+  getOrgId,
+  getProjectId,
+  getApiKey,
+} from '../utils/util_functions';
+import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
 // Local types for this file
 type MutableMutationObserver = MutationObserver & {
@@ -20,7 +30,7 @@ type MutableMutationObserver = MutationObserver & {
 export {};
 
 try {
-  let isProcessingMem0: boolean = false;
+  let isProcessingRememberMe: boolean = false;
 
   let memoryModalShown: boolean = false;
 
@@ -50,12 +60,8 @@ try {
       const data = await new Promise<SearchStorage>(resolve => {
         chrome.storage.sync.get(
           [
-            StorageKey.API_KEY,
-            StorageKey.USER_ID_CAMEL,
-            StorageKey.ACCESS_TOKEN,
-            StorageKey.SELECTED_ORG,
-            StorageKey.SELECTED_PROJECT,
-            StorageKey.USER_ID,
+            StorageKey.SUPABASE_ACCESS_TOKEN,
+            StorageKey.SUPABASE_USER_ID,
             StorageKey.SIMILARITY_THRESHOLD,
             StorageKey.TOP_K,
           ],
@@ -65,15 +71,19 @@ try {
         );
       });
 
-      const apiKey = data[StorageKey.API_KEY];
-      const accessToken = data[StorageKey.ACCESS_TOKEN];
-      if (!apiKey && !accessToken) {
+      const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+      const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+      if (!supabaseAccessToken || !supabaseUserId) {
         return [];
       }
 
-      const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
-      const userId =
-        data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        console.error('[Replit] VITE_MEM0_API_KEY not configured');
+        return;
+      }
+      const authHeader = `Token ${apiKey}`;
+      const userId = supabaseUserId;
       const threshold =
         data[StorageKey.SIMILARITY_THRESHOLD] !== undefined
           ? data[StorageKey.SIMILARITY_THRESHOLD]
@@ -81,21 +91,22 @@ try {
       const topK = data[StorageKey.TOP_K] !== undefined ? data[StorageKey.TOP_K] : 10;
 
       const optionalParams: OptionalApiParams = {};
-      if (data[StorageKey.SELECTED_ORG]) {
-        optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+      const orgId = getOrgId();
+      const projectId = getProjectId();
+      if (orgId) {
+        optionalParams.org_id = orgId;
       }
-      if (data[StorageKey.SELECTED_PROJECT]) {
-        optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+      if (projectId) {
+        optionalParams.project_id = projectId;
       }
 
       const payload = {
         query,
-        filters: { user_id: userId },
+        filters: buildSearchFilters(supabaseUserId),
         rerank: true,
         threshold: threshold,
         top_k: topK,
         filter_memories: false,
-        source: 'OPENMEMORY_CHROME_EXTENSION',
         ...optionalParams,
       };
 
@@ -115,11 +126,8 @@ try {
       return await res.json();
     },
 
-    // Don’t render on prefetch. When modal is open, update it.
+    // Don't render on prefetch. When modal is open, update it.
     onSuccess: function (normQuery: string, responseData: MemorySearchItem[]) {
-      if (!memoryModalShown) {
-        return;
-      }
       const memoryItems = ((responseData as MemorySearchItem[]) || []).map(
         (item: MemorySearchItem) => ({
           id: String(item.id),
@@ -127,18 +135,32 @@ try {
           categories: item.categories || [],
         })
       );
-      createMemoryModal(memoryItems, false);
+
+      const count = memoryItems.length;
+      const openModalCallback = () => {
+        if (count > 0) {
+          createMemoryModal(memoryItems, false);
+          memoryModalShown = true;
+        } else {
+          createMemoryModal([], false);
+          memoryModalShown = true;
+        }
+      };
+
+      showMemoryNotification(count, normQuery, openModalCallback);
     },
 
     onError: function () {
-      if (memoryModalShown) {
+      const openModalCallback = () => {
         createMemoryModal([], false);
-      }
+        memoryModalShown = true;
+      };
+      showMemoryNotification(0, undefined, openModalCallback);
     },
 
-    minLength: 3,
-    debounceMs: 75,
-    cacheTTL: 60000,
+    minLength: 5,
+    debounceMs: 400,
+    cacheTTL: 300000,
   });
 
   let replitBackgroundSearchHandler: (() => void) | null = null;
@@ -156,11 +178,16 @@ try {
     if (!replitBackgroundSearchHandler) {
       replitBackgroundSearchHandler = function () {
         const text = (textarea.textContent || textarea.innerText || '').trim();
+        
+        // Only search if query should trigger (sentence completion or substantial content)
+        if (!shouldTriggerMemorySearch(text)) {
+          return;
+        }
+        
         replitSearch.setText(text);
       };
     }
     textarea.addEventListener('input', replitBackgroundSearchHandler);
-    textarea.addEventListener('keyup', replitBackgroundSearchHandler);
   }
 
   function getTextarea(): HTMLElement | null {
@@ -321,7 +348,7 @@ try {
     }
 
     // Remove any memory headers and content
-    const memoryPrefix = OPENMEMORY_PROMPTS.memory_header_text;
+    const memoryPrefix = REMEMBERME_PROMPTS.memory_header_text;
     const prefixIndex = content.indexOf(memoryPrefix);
     if (prefixIndex !== -1) {
       content = content.substring(0, prefixIndex).trim();
@@ -329,8 +356,8 @@ try {
 
     // Also try with regex pattern
     try {
-      const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-      content = content.replace(MEM0_PLAIN, '').trim();
+      const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+      content = content.replace(REMEMBERME_PLAIN, '').trim();
     } catch {
       // Ignore regex errors
     }
@@ -407,32 +434,35 @@ try {
       // Asynchronously store the memory
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.MEMORY_ENABLED,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
         ],
         function (items) {
+          const supabaseAccessToken = items[StorageKey.SUPABASE_ACCESS_TOKEN];
+          const supabaseUserId = items[StorageKey.SUPABASE_USER_ID];
+          
           // Skip if memory is disabled or no credentials
-          if (items.memory_enabled === false || (!items.apiKey && !items.access_token)) {
+          if (items.memory_enabled === false || !supabaseAccessToken || !supabaseUserId) {
             return;
           }
 
-          const authHeader = items.access_token
-            ? `Bearer ${items.access_token}`
-            : `Token ${items.apiKey}`;
-
-          const userId = items.userId || items.user_id || 'chrome-extension-user';
+          const apiKey = getApiKey();
+      if (!apiKey) {
+        console.error('[Replit] VITE_MEM0_API_KEY not configured');
+        return;
+      }
+      const authHeader = `Token ${apiKey}`;
+          const userId = supabaseUserId;
 
           const optionalParams: OptionalApiParams = {};
-          if (items.selected_org) {
-            optionalParams.org_id = items.selected_org;
+          const orgId = getOrgId();
+          const projectId = getProjectId();
+          if (orgId) {
+            optionalParams.org_id = orgId;
           }
-          if (items.selected_project) {
-            optionalParams.project_id = items.selected_project;
+          if (projectId) {
+            optionalParams.project_id = projectId;
           }
 
           // Send memory to mem0 API asynchronously without waiting for response
@@ -449,7 +479,7 @@ try {
               metadata: {
                 provider: 'Replit',
               },
-              source: 'OPENMEMORY_CHROME_EXTENSION',
+              version: 'v2',
               ...optionalParams,
             }),
           })
@@ -479,8 +509,8 @@ try {
     for (const selector of selectors) {
       sendButton = document.querySelector(selector);
       if (sendButton) {
-        if (!sendButton.dataset.mem0Listener) {
-          sendButton.dataset.mem0Listener = 'true';
+        if (!sendButton.dataset.remembermeListener) {
+          sendButton.dataset.remembermeListener = 'true';
           sendButton.addEventListener('click', function () {
             captureAndStoreMemory();
           });
@@ -496,8 +526,8 @@ try {
     // Handle textarea for Enter key press - check each time
     const textarea = getTextarea();
     if (textarea) {
-      if (!textarea.dataset.mem0KeyListener) {
-        textarea.dataset.mem0KeyListener = 'true';
+      if (!textarea.dataset.remembermeKeyListener) {
+        textarea.dataset.remembermeKeyListener = 'true';
 
         // Add keydown listener for Enter key
         textarea.addEventListener('keydown', function (event: KeyboardEvent) {
@@ -536,9 +566,9 @@ try {
   }
 
   // Handler for the modal approach
-  async function handleMem0Modal() {
+  async function handleRememberMeModal() {
     // Prevent multiple simultaneous modals
-    if (isProcessingMem0) {
+    if (isProcessingRememberMe) {
       return;
     }
 
@@ -552,18 +582,9 @@ try {
       return;
     }
 
-    // Check if user is logged in
-    const loginData = await new Promise<StorageItems>(resolve => {
-      chrome.storage.sync.get(
-        [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
-        function (items) {
-          resolve(items as StorageItems);
-        }
-      );
-    });
-
-    // If no API key and no access token, show login popup
-    if (!loginData.apiKey && !loginData.access_token) {
+    // Check if user is logged in (Supabase or legacy)
+    const hasAuth = await hasValidAuth();
+    if (!hasAuth) {
       showLoginPopup();
       return;
     }
@@ -576,9 +597,9 @@ try {
     // If no message, show a popup and return
     if (!message) {
       // Show message that requires input
-      const mem0Button = document.querySelector('button[aria-label="Mem0"]') as HTMLElement | null;
-      if (mem0Button) {
-        showButtonPopup(mem0Button, 'Please enter some text first');
+      const remembermeButton = document.querySelector('button[aria-label="Mem0"]') as HTMLElement | null;
+      if (remembermeButton) {
+        showButtonPopup(remembermeButton, 'Please enter some text first');
       }
       return;
     }
@@ -586,11 +607,11 @@ try {
     // Clean the message of any existing memory content
     message = getContentWithoutMemories();
 
-    isProcessingMem0 = true;
+    isProcessingRememberMe = true;
 
     // Add a timeout to reset the flag if something goes wrong
     const timeoutId = setTimeout((): void => {
-      isProcessingMem0 = false;
+      isProcessingRememberMe = false;
     }, 30000); // 30 second timeout
 
     // Show the loading modal immediately with the source button ID
@@ -600,12 +621,8 @@ try {
       const data = await new Promise<StorageItems>(resolve => {
         chrome.storage.sync.get(
           [
-            StorageKey.API_KEY,
-            StorageKey.USER_ID_CAMEL,
-            StorageKey.ACCESS_TOKEN,
-            StorageKey.SELECTED_ORG,
-            StorageKey.SELECTED_PROJECT,
-            StorageKey.USER_ID,
+            StorageKey.SUPABASE_ACCESS_TOKEN,
+            StorageKey.SUPABASE_USER_ID,
             StorageKey.SIMILARITY_THRESHOLD,
             StorageKey.TOP_K,
           ],
@@ -615,33 +632,35 @@ try {
         );
       });
 
-      const apiKey = data[StorageKey.API_KEY];
-      const userId = (data[StorageKey.USER_ID_CAMEL] ||
-        data[StorageKey.USER_ID] ||
-        'chrome-extension-user') as string;
-      const accessToken = data[StorageKey.ACCESS_TOKEN];
+      const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+      const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+      
+      if (!supabaseAccessToken || !supabaseUserId) {
+        return;
+      }
 
       const optionalParams: OptionalApiParams = {};
-
-      if (data[StorageKey.SELECTED_ORG]) {
-        optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+      const orgId = getOrgId();
+      const projectId = getProjectId();
+      if (orgId) {
+        optionalParams.org_id = orgId;
       }
-      if (data[StorageKey.SELECTED_PROJECT]) {
-        optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
-      }
-
-      if (!apiKey && !accessToken) {
-        isProcessingMem0 = false;
-        return;
+      if (projectId) {
+        optionalParams.project_id = projectId;
       }
 
       sendExtensionEvent('modal_clicked', {
         provider: 'replit',
-        source: 'OPENMEMORY_CHROME_EXTENSION',
+        source: 'REMEMBERME_CHROME_EXTENSION',
         browser: getBrowser(),
       });
 
-      const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        console.error('[Replit] VITE_MEM0_API_KEY not configured');
+        return;
+      }
+      const authHeader = `Token ${apiKey}`;
 
       const messages = [{ role: MessageRole.User, content: message }];
 
@@ -656,12 +675,12 @@ try {
         },
         body: JSON.stringify({
           messages: messages,
-          user_id: userId,
+          user_id: supabaseUserId,
           infer: true,
           metadata: {
             provider: 'Replit',
           },
-          source: 'OPENMEMORY_CHROME_EXTENSION',
+          version: 'v2',
           ...optionalParams,
         }),
       }).catch(error => {
@@ -673,7 +692,7 @@ try {
       createMemoryModal([], false);
     } finally {
       clearTimeout(timeoutId);
-      isProcessingMem0 = false;
+      isProcessingRememberMe = false;
     }
   }
 
@@ -693,164 +712,167 @@ try {
         // Ignore background search errors
       }
 
-      if (OPENMEMORY_UI && OPENMEMORY_UI.mountOnEditorFocus) {
-        try {
-          if (!document.getElementById('mem0-icon-button')) {
-            OPENMEMORY_UI.resolveCachedAnchor(
-              { learnKey: location.host + ':' + location.pathname },
-              null,
-              24 * 60 * 60 * 1000
-            ).then(function (hit: { el: Element; placement: Placement | null } | null) {
-              if (!hit || !hit.el) {
-                return;
-              }
-              let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
-              let host = hs.host,
-                shadow = hs.shadow;
-              host.id = 'mem0-icon-button';
-              let cfg =
-                typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit
-                  ? SITE_CONFIG.replit
-                  : null;
-              let placement = hit.placement ||
-                (cfg && cfg.placement) || { strategy: 'float', placement: 'right-center', gap: 12 };
-              OPENMEMORY_UI.applyPlacement({
-                container: host,
-                anchor: hit.el,
-                placement: placement,
-              });
-              let style = document.createElement('style');
-              style.textContent = `
-                :host { position: relative; }
-                .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
-                .mem0-btn img { width:20px; height:20px; border-radius:50%; }
-                .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-                :host([data-has-text="1"]) .dot { display:block; }
-              `;
-              let btn = document.createElement('button');
-              btn.className = 'mem0-btn';
-              let img = document.createElement('img');
-              img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-              let dot = document.createElement('div');
-              dot.className = 'dot';
-              btn.appendChild(img);
-              shadow.append(style, btn, dot);
-              btn.addEventListener('click', function () {
-                handleMem0Modal();
-              });
-              if (typeof updateNotificationDot === 'function') {
-                setTimeout(updateNotificationDot, 0);
-              }
-            });
-          }
-        } catch (_) {
-          // Ignore errors during re-initialization
-        }
+      // COMMENTED OUT: Icon button injection - using notification-only approach
+      // if (REMEMBERME_UI && REMEMBERME_UI.mountOnEditorFocus) {
+      //   try {
+      //     if (!document.getElementById('rememberme-icon-button')) {
+      //       REMEMBERME_UI.resolveCachedAnchor(
+      //         { learnKey: location.host + ':' + location.pathname },
+      //         null,
+      //         24 * 60 * 60 * 1000
+      //       ).then(function (hit: { el: Element; placement: Placement | null } | null) {
+      //         if (!hit || !hit.el) {
+      //           return;
+      //         }
+      //         let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
+      //         let host = hs.host,
+      //           shadow = hs.shadow;
+      //         host.id = 'rememberme-icon-button';
+      //         let cfg =
+      //           typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit
+      //             ? SITE_CONFIG.replit
+      //             : null;
+      //         let placement = hit.placement ||
+      //           (cfg && cfg.placement) || { strategy: 'float', placement: 'right-center', gap: 12 };
+      //         REMEMBERME_UI.applyPlacement({
+      //           container: host,
+      //           anchor: hit.el,
+      //           placement: placement,
+      //         });
+      //         let style = document.createElement('style');
+      //         style.textContent = `
+      //           :host { position: relative; }
+      //           .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
+      //           .rememberme-btn img { width:20px; height:20px; border-radius:50%; }
+      //           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+      //           :host([data-has-text="1"]) .dot { display:block; }
+      //         `;
+      //         let btn = document.createElement('button');
+      //         btn.className = 'rememberme-btn';
+      //         let img = document.createElement('img');
+      //         img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+      //         let dot = document.createElement('div');
+      //         dot.className = 'dot';
+      //         btn.appendChild(img);
+      //         shadow.append(style, btn, dot);
+      //         btn.addEventListener('click', function () {
+      //           handleRememberMeModal();
+      //         });
+      //         if (typeof updateNotificationDot === 'function') {
+      //           setTimeout(updateNotificationDot, 0);
+      //         }
+      //       });
+      //     }
+      //   } catch (_) {
+      //     // Ignore errors during re-initialization
+      //   }
+      // }
 
-        OPENMEMORY_UI.mountOnEditorFocus({
-          existingHostSelector: '#mem0-icon-button',
-          editorSelector:
-            typeof SITE_CONFIG !== 'undefined' &&
-            SITE_CONFIG.replit &&
-            SITE_CONFIG.replit.editorSelector
-              ? SITE_CONFIG.replit.editorSelector
-              : 'textarea, [contenteditable="true"], input[type="text"]',
-          deriveAnchor:
-            typeof SITE_CONFIG !== 'undefined' &&
-            SITE_CONFIG.replit &&
-            typeof SITE_CONFIG.replit.deriveAnchor === 'function'
-              ? SITE_CONFIG.replit.deriveAnchor
-              : function (editor: Element) {
-                  return editor.closest('form') || editor.parentElement || document.body;
-                },
-          placement:
-            typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit && SITE_CONFIG.replit.placement
-              ? SITE_CONFIG.replit.placement
-              : { strategy: 'float', placement: 'right-center', gap: 12 },
-          render: function (shadow: ShadowRoot, host: HTMLElement) {
-            host.id = 'mem0-icon-button';
-            let style = document.createElement('style');
-            style.textContent = `
-              :host { position: relative; }
-              .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
-              .mem0-btn img { width:20px; height:20px; border-radius:50%; }
-              .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-              :host([data-has-text="1"]) .dot { display:block; }
-            `;
-            let btn = document.createElement('button');
-            btn.className = 'mem0-btn';
-            let img = document.createElement('img');
-            img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-            let dot = document.createElement('div');
-            dot.className = 'dot';
-            btn.appendChild(img);
-            shadow.append(style, btn, dot);
-            btn.addEventListener('click', function () {
-              handleMem0Modal();
-            });
-            if (typeof updateNotificationDot === 'function') {
-              setTimeout(updateNotificationDot, 0);
-            }
-          },
-          fallback: function () {
-            let cfg =
-              typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit ? SITE_CONFIG.replit : null;
-            return OPENMEMORY_UI.mountResilient({
-              anchors: [
-                {
-                  find: function () {
-                    let sel =
-                      (cfg && cfg.editorSelector) ||
-                      'textarea, [contenteditable="true"], input[type="text"]';
-                    let ed = document.querySelector(sel);
-                    if (!ed) {
-                      return null;
-                    }
-                    try {
-                      return cfg && typeof cfg.deriveAnchor === 'function'
-                        ? cfg.deriveAnchor(ed)
-                        : ed.closest('form') || ed.parentElement || document.body;
-                    } catch (_) {
-                      return ed.closest('form') || ed.parentElement || document.body;
-                    }
-                  },
-                },
-              ],
-              placement: (cfg && cfg.placement) || {
-                strategy: 'float',
-                placement: 'right-center',
-                gap: 12,
-              },
-              enableFloatingFallback: true,
-              render: function (shadow: ShadowRoot, host: HTMLElement) {
-                host.id = 'mem0-icon-button';
-                let style = document.createElement('style');
-                style.textContent = `
-                  :host { position: relative; }
-                  .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
-                  .mem0-btn img { width:20px; height:20px; border-radius:50%; }
-                  .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-                  :host([data-has-text="1"]) .dot { display:block; }
-                `;
-                let btn = document.createElement('button');
-                btn.className = 'mem0-btn';
-                let img = document.createElement('img');
-                img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-                let dot = document.createElement('div');
-                dot.className = 'dot';
-                btn.appendChild(img);
-                shadow.append(style, btn, dot);
-                btn.addEventListener('click', function () {
-                  handleMem0Modal();
-                });
-                if (typeof updateNotificationDot === 'function') {
-                  setTimeout(updateNotificationDot, 0);
-                }
-              },
-            });
-          },
-        });
-      }
+      // COMMENTED OUT: Icon button injection - using notification-only approach
+      // REMEMBERME_UI.mountOnEditorFocus({
+      //   existingHostSelector: '#rememberme-icon-button',
+      //   editorSelector:
+      //     typeof SITE_CONFIG !== 'undefined' &&
+      //     SITE_CONFIG.replit &&
+      //     SITE_CONFIG.replit.editorSelector
+      //       ? SITE_CONFIG.replit.editorSelector
+      //       : 'textarea, [contenteditable="true"], input[type="text"]',
+      //   deriveAnchor:
+      //     typeof SITE_CONFIG !== 'undefined' &&
+      //     SITE_CONFIG.replit &&
+      //     typeof SITE_CONFIG.replit.deriveAnchor === 'function'
+      //       ? SITE_CONFIG.replit.deriveAnchor
+      //       : function (editor: Element) {
+      //           return editor.closest('form') || editor.parentElement || document.body;
+      //         },
+      //   placement:
+      //     typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit && SITE_CONFIG.replit.placement
+      //       ? SITE_CONFIG.replit.placement
+      //       : { strategy: 'float', placement: 'right-center', gap: 12 },
+      //   render: function (shadow: ShadowRoot, host: HTMLElement) {
+      //     host.id = 'rememberme-icon-button';
+      //     let style = document.createElement('style');
+      //     style.textContent = `
+      //       :host { position: relative; }
+      //       .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
+      //       .rememberme-btn img { width:20px; height:20px; border-radius:50%; }
+      //       .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+      //       :host([data-has-text="1"]) .dot { display:block; }
+      //     `;
+      //     let btn = document.createElement('button');
+      //     btn.className = 'rememberme-btn';
+      //     let img = document.createElement('img');
+      //     img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+      //     let dot = document.createElement('div');
+      //     dot.className = 'dot';
+      //     btn.appendChild(img);
+      //     shadow.append(style, btn, dot);
+      //     btn.addEventListener('click', function () {
+      //       handleRememberMeModal();
+      //     });
+      //     if (typeof updateNotificationDot === 'function') {
+      //       setTimeout(updateNotificationDot, 0);
+      //     }
+      //   },
+      //   fallback: function () {
+      //     let cfg =
+      //       typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.replit ? SITE_CONFIG.replit : null;
+      //     return REMEMBERME_UI.mountResilient({
+      //       anchors: [
+      //         {
+      //           find: function () {
+      //             let sel =
+      //               (cfg && cfg.editorSelector) ||
+      //               'textarea, [contenteditable="true"], input[type="text"]';
+      //             let ed = document.querySelector(sel);
+      //             if (!ed) {
+      //               return null;
+      //             }
+      //             try {
+      //               return cfg && typeof cfg.deriveAnchor === 'function'
+      //                 ? cfg.deriveAnchor(ed)
+      //                 : ed.closest('form') || ed.parentElement || document.body;
+      //             } catch (_) {
+      //               return ed.closest('form') || ed.parentElement || document.body;
+      //             }
+      //           },
+      //         },
+      //       ],
+      //       placement: (cfg && cfg.placement) || {
+      //         strategy: 'float',
+      //         placement: 'right-center',
+      //         gap: 12,
+      //       },
+      //       enableFloatingFallback: true,
+      //       render: function (shadow: ShadowRoot, host: HTMLElement) {
+      //         host.id = 'rememberme-icon-button';
+      //         let style = document.createElement('style');
+      //         style.textContent = `
+      //           :host { position: relative; }
+      //           .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%; box-shadow: 0 6px 16px rgba(0,0,0,0.3); background:#1C1C1E; }
+      //           .rememberme-btn img { width:20px; height:20px; border-radius:50%; }
+      //           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+      //           :host([data-has-text="1"]) .dot { display:block; }
+      //         `;
+      //         let btn = document.createElement('button');
+      //         btn.className = 'rememberme-btn';
+      //         let img = document.createElement('img');
+      //         img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+      //         let dot = document.createElement('div');
+      //         dot.className = 'dot';
+      //         btn.appendChild(img);
+      //         shadow.append(style, btn, dot);
+      //         btn.addEventListener('click', function () {
+      //           handleRememberMeModal();
+      //         });
+      //         if (typeof updateNotificationDot === 'function') {
+      //           setTimeout(updateNotificationDot, 0);
+      //         }
+      //       },
+      //     });
+      //   },
+        // });
+      // }
 
       addSendButtonListener();
     } catch (error) {
@@ -901,7 +923,7 @@ try {
         if (event.ctrlKey && event.key === 'm') {
           event.preventDefault();
           (async () => {
-            await handleMem0Modal();
+            await handleRememberMeModal();
           })();
         }
       });
@@ -915,7 +937,7 @@ try {
       attributeFilter: ['class', 'style'],
     });
 
-    // Replace periodic button injection checks; OPENMEMORY_UI handles mounting
+    // Replace periodic button injection checks; REMEMBERME_UI handles mounting
     const memoryStateCheckInterval = setInterval(async () => {
       const memoryEnabled = await getMemoryEnabledState();
       const buttonExists = document.querySelector('button[aria-label="Mem0"]');
@@ -963,7 +985,7 @@ try {
       const baseContent = getContentWithoutMemories();
 
       // Create the memory string with all collected memories
-      let memoriesContent = '\n\n' + OPENMEMORY_PROMPTS.memory_header_text + '\n';
+      let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
 
       // Add all memories to the content
       allMemories.forEach((mem, index) => {
@@ -981,13 +1003,13 @@ try {
   // Function to show a small popup message near the button
   function showButtonPopup(button: HTMLElement, message: string): void {
     // Remove any existing popups
-    const existingPopup = document.querySelector('.mem0-button-popup');
+    const existingPopup = document.querySelector('.rememberme-button-popup');
     if (existingPopup) {
       existingPopup.remove();
     }
 
     const popup = document.createElement('div');
-    popup.className = 'mem0-button-popup';
+    popup.className = 'rememberme-button-popup';
 
     popup.style.cssText = `
     position: absolute;
@@ -1039,14 +1061,14 @@ try {
   // Function to show login popup
   function showLoginPopup() {
     // First remove any existing popups
-    const existingPopup = document.querySelector('#mem0-login-popup');
+    const existingPopup = document.querySelector('#rememberme-login-popup');
     if (existingPopup) {
       existingPopup.remove();
     }
 
     // Create popup container
     const popupOverlay = document.createElement('div');
-    popupOverlay.id = 'mem0-login-popup';
+    popupOverlay.id = 'rememberme-login-popup';
     popupOverlay.style.cssText = `
     position: fixed;
     top: 0;
@@ -1098,7 +1120,7 @@ try {
   `;
 
     const heading = document.createElement('h2');
-    heading.textContent = 'Sign in to OpenMemory';
+    heading.textContent = 'Sign in to RememberMe';
     heading.style.cssText = `
     margin: 0;
     font-size: 18px;
@@ -1140,7 +1162,7 @@ try {
 
     // Add logo and text
     const logoDark = document.createElement('img');
-    logoDark.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+    logoDark.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
     logoDark.style.cssText = `
     width: 20px;
     height: 20px;
@@ -1148,7 +1170,7 @@ try {
   `;
 
     const signInText = document.createElement('span');
-    signInText.textContent = 'Sign in with OpenMemory';
+    signInText.textContent = 'Sign in with RememberMe';
 
     signInButton.appendChild(logoDark);
     signInButton.appendChild(signInText);
@@ -1223,10 +1245,10 @@ try {
       topPosition = Math.max(0, Math.min(topPosition, maxY));
     } else {
       // Position relative to the Mem0 button (original logic)
-      const mem0Button = document.querySelector('#mem0-icon-button');
+      const remembermeButton = document.querySelector('#rememberme-icon-button');
 
-      if (mem0Button) {
-        const buttonRect = mem0Button.getBoundingClientRect();
+      if (remembermeButton) {
+        const buttonRect = remembermeButton.getBoundingClientRect();
 
         // Determine if there's enough space below the button
         const viewportHeight = window.innerHeight;
@@ -1388,16 +1410,16 @@ try {
 
     // Add Mem0 logo
     const logoImg = document.createElement('img');
-    logoImg.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+    logoImg.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
     logoImg.style.cssText = `
     width: 26px;
     height: 26px;
     border-radius: 50%;
   `;
 
-    // Add "OpenMemory" title
+    // Add "RememberMe" title
     const title = document.createElement('div');
-    title.textContent = 'OpenMemory';
+    title.textContent = 'RememberMe';
     title.style.cssText = `
     font-size: 16px;
     font-weight: 600;
@@ -1854,7 +1876,7 @@ try {
 
           sendExtensionEvent('memory_injection', {
             provider: 'replit',
-            source: 'OPENMEMORY_CHROME_EXTENSION',
+            source: 'REMEMBERME_CHROME_EXTENSION',
             browser: getBrowser(),
             injected_all: false,
             memory_id: memory.id,
@@ -2097,7 +2119,7 @@ try {
 
       sendExtensionEvent('memory_injection', {
         provider: 'replit',
-        source: 'OPENMEMORY_CHROME_EXTENSION',
+        source: 'REMEMBERME_CHROME_EXTENSION',
         browser: getBrowser(),
         injected_all: true,
         memory_count: newMemories.length,
@@ -2135,7 +2157,7 @@ try {
   // Function to update notification dot visibility based on text in the input
   function updateNotificationDot() {
     const textarea = getTextarea();
-    const notificationDot = document.querySelector('#mem0-notification-dot');
+    const notificationDot = document.querySelector('#rememberme-notification-dot');
 
     if (!textarea || !notificationDot) {
       return;

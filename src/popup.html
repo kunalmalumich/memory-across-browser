@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mem0 Sign In</title>
+    <title>RememberMe Sign In</title>
     <style>
       body {
         font-family:
@@ -64,19 +64,65 @@
       .google-icon {
         margin-right: 10px;
       }
+      .email-input {
+        width: 100%;
+        padding: 10px;
+        margin-bottom: 10px;
+        border-radius: 8px;
+        border: 1px solid #333;
+        background: #2c2c2e;
+        color: white;
+        font-size: 14px;
+        box-sizing: border-box;
+      }
+      .email-input:focus {
+        outline: none;
+        border-color: white;
+      }
+      .error-message {
+        color: #ff6b6b;
+        font-size: 12px;
+        margin-bottom: 10px;
+        display: none;
+        text-align: left;
+      }
+      .success-message {
+        color: #51cf66;
+        font-size: 12px;
+        margin-bottom: 10px;
+        display: none;
+        text-align: center;
+      }
+      .button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
     </style>
   </head>
   <body>
     <div class="logo-container">
-      <h2 class="heading">Sign in to OpenMemory</h2>
+      <h2 class="heading">Sign in to RememberMe</h2>
     </div>
     <div class="content">
       <p class="message">
-        Please sign in to access your memories and personalize your conversations!
+        Enter your email to receive a Magic Link
       </p>
-      <button id="googleSignInButton" class="button">
-        <img src="../icons/mem0-icon-black.png" alt="Mem0 Logo" class="logo" />
-        <span>Sign in with Mem0</span>
+      <input 
+        type="email" 
+        id="emailInput" 
+        class="email-input"
+        placeholder="Enter your email"
+        autocomplete="email"
+      />
+      <div id="errorMessage" class="error-message"></div>
+      <div id="successMessage" class="success-message"></div>
+      <button id="sendMagicLinkButton" class="button">
+        <span>Send Magic Link</span>
+      </button>
+      <!-- Legacy button (hidden by default, can be shown if needed) -->
+      <button id="googleSignInButton" class="button" style="display: none;">
+        <img src="../icons/rememberme-icon.png" alt="RememberMe Logo" class="logo" />
+        <span>Sign in with RememberMe</span>
       </button>
     </div>
     <script type="module" src="/src/popup.ts"></script>

@@ -1,28 +1,25 @@
-import { type ApiMemoryRequest, DEFAULT_USER_ID, MessageRole, SOURCE } from './types/api';
+import { type ApiMemoryRequest, MessageRole } from './types/api';
 import type { OnCommittedDetails } from './types/browser';
 import { Category, Provider } from './types/providers';
 import type { Settings } from './types/settings';
 import { StorageKey } from './types/storage';
+import { getOrgId, getProjectId, getApiKey } from './utils/util_functions';
 
 function getSettings(): Promise<Settings> {
   return new Promise(resolve => {
     chrome.storage.sync.get(
       [
-        StorageKey.API_KEY,
-        StorageKey.ACCESS_TOKEN,
-        StorageKey.USER_ID,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
+        StorageKey.SUPABASE_ACCESS_TOKEN,
+        StorageKey.SUPABASE_USER_ID,
         StorageKey.MEMORY_ENABLED,
       ],
       d => {
         resolve({
-          hasCreds: Boolean(d[StorageKey.API_KEY] || d[StorageKey.ACCESS_TOKEN]),
-          apiKey: d[StorageKey.API_KEY],
-          accessToken: d[StorageKey.ACCESS_TOKEN],
-          userId: d[StorageKey.USER_ID] || DEFAULT_USER_ID,
-          orgId: d[StorageKey.SELECTED_ORG],
-          projectId: d[StorageKey.SELECTED_PROJECT],
+          hasCreds: Boolean(d[StorageKey.SUPABASE_ACCESS_TOKEN] && d[StorageKey.SUPABASE_USER_ID]),
+          supabaseAccessToken: d[StorageKey.SUPABASE_ACCESS_TOKEN] ?? null,
+          supabaseUserId: d[StorageKey.SUPABASE_USER_ID] ?? null,
+          orgId: getOrgId() ?? null,
+          projectId: getProjectId() ?? null,
           memoryEnabled: d[StorageKey.MEMORY_ENABLED] !== false,
         });
       }
@@ -31,24 +28,29 @@ function getSettings(): Promise<Settings> {
 }
 
 async function addMemory(content: string, settings: Settings, pageUrl: string): Promise<boolean> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (settings.accessToken) {
-    headers.Authorization = `Bearer ${settings.accessToken}`;
-  } else if (settings.apiKey) {
-    headers.Authorization = `Token ${settings.apiKey}`;
-  } else {
-    throw new Error('Missing credentials');
+  if (!settings.supabaseAccessToken || !settings.supabaseUserId) {
+    throw new Error('Missing Supabase credentials');
   }
+
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    throw new Error('VITE_MEM0_API_KEY not configured');
+  }
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Token ${apiKey}`,
+  };
 
   const body: ApiMemoryRequest = {
     messages: [{ role: MessageRole.User, content }],
-    user_id: settings.userId,
+    user_id: settings.supabaseUserId,
     metadata: {
       provider: Provider.DirectURL,
       category: Category.NAVIGATION,
       page_url: pageUrl || '',
     },
-    source: SOURCE,
+    version: 'v2',
   };
   if (settings.orgId) {
     body.org_id = settings.orgId;

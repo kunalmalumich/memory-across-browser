@@ -10,9 +10,9 @@ declare global {
     msOverflowStyle?: string;
   }
   interface Window {
-    mem0Initialized?: boolean;
+    remembermeInitialized?: boolean;
     mem0KeyboardListenersAdded?: boolean;
-    mem0ButtonAdded?: boolean;
+    remembermeButtonAdded?: boolean;
   }
 }
 

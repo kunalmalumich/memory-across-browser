@@ -1,8 +1,7 @@
-/** User preference structure with API keys, memory settings, and thresholds */
+/** User preference structure with memory settings and thresholds */
 export type UserSettings = Partial<{
-  apiKey: string;
-  accessToken: string;
-  userId: string;
+  supabaseAccessToken: string;
+  supabaseUserId: string;
   memoryEnabled: boolean;
   selectedOrg: string;
   selectedProject: string;
@@ -12,7 +11,7 @@ export type UserSettings = Partial<{
 
 /** Sidebar-specific settings with organization and project info */
 export type SidebarSettings = {
-  user_id?: string;
+  supabase_user_id?: string;
   selected_org?: string;
   selected_org_name?: string;
   selected_project?: string;
@@ -24,12 +23,11 @@ export type SidebarSettings = {
   track_searches: boolean;
 };
 
-/** Legacy settings structure for compatibility */
+/** Settings structure for API calls */
 export type Settings = {
   hasCreds: boolean;
-  apiKey: string | null;
-  accessToken: string | null;
-  userId: string;
+  supabaseAccessToken: string | null;
+  supabaseUserId: string | null;
   orgId: string | null;
   projectId: string | null;
   memoryEnabled: boolean;

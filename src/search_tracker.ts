@@ -1,7 +1,7 @@
-import { DEFAULT_USER_ID } from './types/api';
 import type { HistoryStateData, HistoryUrl } from './types/browser';
 import type { Settings } from './types/settings';
 import { StorageKey } from './types/storage';
+import { getOrgId, getProjectId } from './utils/util_functions';
 
 (function () {
   // Utilities
@@ -13,21 +13,17 @@ import { StorageKey } from './types/storage';
     return new Promise<Settings>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.USER_ID,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.MEMORY_ENABLED,
         ],
         d => {
           resolve({
-            hasCreds: Boolean(d[StorageKey.API_KEY] || d[StorageKey.ACCESS_TOKEN]),
-            apiKey: d[StorageKey.API_KEY],
-            accessToken: d[StorageKey.ACCESS_TOKEN],
-            userId: d[StorageKey.USER_ID] || DEFAULT_USER_ID,
-            orgId: d[StorageKey.SELECTED_ORG],
-            projectId: d[StorageKey.SELECTED_PROJECT],
+            hasCreds: Boolean(d[StorageKey.SUPABASE_ACCESS_TOKEN] && d[StorageKey.SUPABASE_USER_ID]),
+            supabaseAccessToken: d[StorageKey.SUPABASE_ACCESS_TOKEN] ?? null,
+            supabaseUserId: d[StorageKey.SUPABASE_USER_ID] ?? null,
+            orgId: getOrgId() ?? null,
+            projectId: getProjectId() ?? null,
             memoryEnabled: d[StorageKey.MEMORY_ENABLED] !== false,
           });
         }

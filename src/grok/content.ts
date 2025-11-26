@@ -4,14 +4,24 @@ import type { MemoryItem, MemorySearchItem, OptionalApiParams } from '../types/m
 import { SidebarAction } from '../types/messages';
 import { type StorageItems, StorageKey } from '../types/storage';
 import { createOrchestrator, type SearchStorage } from '../utils/background_search';
-import { OPENMEMORY_PROMPTS } from '../utils/llm_prompts';
+import { REMEMBERME_PROMPTS } from '../utils/llm_prompts';
 import { SITE_CONFIG } from '../utils/site_config';
-import { getBrowser, sendExtensionEvent } from '../utils/util_functions';
-import { OPENMEMORY_UI, type Placement } from '../utils/util_positioning';
+import {
+  getBrowser,
+  shouldTriggerMemorySearch,
+  sendExtensionEvent,
+  showMemoryNotification,
+  buildSearchFilters,
+  hasValidAuth,
+  getOrgId,
+  getProjectId,
+  getApiKey,
+} from '../utils/util_functions';
+import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
 export {};
 
-let isProcessingMem0 = false;
+let isProcessingRememberMe = false;
 
 let memoryModalShown: boolean = false;
 
@@ -32,12 +42,8 @@ const grokSearch = createOrchestrator({
     const data = await new Promise<SearchStorage>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.SIMILARITY_THRESHOLD,
           StorageKey.TOP_K,
         ],
@@ -47,15 +53,19 @@ const grokSearch = createOrchestrator({
       );
     });
 
-    const apiKey = data[StorageKey.API_KEY];
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    if (!apiKey && !accessToken) {
+    const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+    const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+    if (!supabaseAccessToken || !supabaseUserId) {
       return [];
     }
 
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
-    const userId =
-      data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      console.error('[Grok] VITE_MEM0_API_KEY not configured');
+      return;
+    }
+    const authHeader = `Token ${apiKey}`;
+    const userId = supabaseUserId;
     const threshold =
       data[StorageKey.SIMILARITY_THRESHOLD] !== undefined
         ? data[StorageKey.SIMILARITY_THRESHOLD]
@@ -63,18 +73,20 @@ const grokSearch = createOrchestrator({
     const topK = data[StorageKey.TOP_K] !== undefined ? data[StorageKey.TOP_K] : 10;
 
     const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+    const orgId = getOrgId();
+    const projectId = getProjectId();
+    if (orgId) {
+      optionalParams.org_id = orgId;
     }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+    if (projectId) {
+      optionalParams.project_id = projectId;
     }
 
     // Clean query by stripping any appended memory header/content (debounced path)
     const cleanQuery = (function () {
       try {
-        const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-        return String(query).replace(MEM0_PLAIN, '').trim();
+        const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+        return String(query).replace(REMEMBERME_PLAIN, '').trim();
       } catch (_e) {
         return query;
       }
@@ -82,12 +94,11 @@ const grokSearch = createOrchestrator({
 
     const payload = {
       query: cleanQuery,
-      filters: { user_id: userId },
+        filters: buildSearchFilters(supabaseUserId),
       rerank: true,
       threshold: threshold,
       top_k: topK,
       filter_memories: false,
-      source: 'OPENMEMORY_CHROME_EXTENSION',
       ...optionalParams,
     };
 
@@ -107,11 +118,8 @@ const grokSearch = createOrchestrator({
     return await res.json();
   },
 
-  // Don’t render on prefetch. When modal is open, update it.
+  // Don't render on prefetch. When modal is open, update it.
   onSuccess: function (normQuery: string, responseData: MemorySearchItem[]) {
-    if (!memoryModalShown) {
-      return;
-    }
     const memoryItems = ((responseData as MemorySearchItem[]) || []).map(
       (item: MemorySearchItem) => ({
         id: String(item.id),
@@ -119,18 +127,32 @@ const grokSearch = createOrchestrator({
         categories: item.categories || [],
       })
     );
-    createMemoryModal(memoryItems, false);
+
+    const count = memoryItems.length;
+    const openModalCallback = () => {
+      if (count > 0) {
+        createMemoryModal(memoryItems, false);
+        memoryModalShown = true;
+      } else {
+        createMemoryModal([], false);
+        memoryModalShown = true;
+      }
+    };
+
+    showMemoryNotification(count, normQuery, openModalCallback);
   },
 
   onError: function () {
-    if (memoryModalShown) {
+    const openModalCallback = () => {
       createMemoryModal([], false);
-    }
+      memoryModalShown = true;
+    };
+    showMemoryNotification(0, undefined, openModalCallback);
   },
 
-  minLength: 3,
-  debounceMs: 75,
-  cacheTTL: 60000,
+  minLength: 5,
+  debounceMs: 400,
+  cacheTTL: 300000,
 });
 
 function getTextarea(): HTMLTextAreaElement | null {
@@ -169,11 +191,16 @@ function hookGrokBackgroundSearchTyping() {
   if (!grokBackgroundSearchHandler) {
     grokBackgroundSearchHandler = function () {
       let text = textarea.value || '';
+      
+      // Only search if query should trigger (sentence completion or substantial content)
+      if (!shouldTriggerMemorySearch(text)) {
+        return;
+      }
+      
       (grokSearch as { setText: (text: string) => void }).setText(text);
     };
   }
   textarea.addEventListener('input', grokBackgroundSearchHandler);
-  textarea.addEventListener('keyup', grokBackgroundSearchHandler);
 }
 
 function setupInputObserver(): void {
@@ -265,7 +292,7 @@ function setInputValue(inputElement: HTMLTextAreaElement | null, value: string):
 //           metadata: {
 //             provider: 'Grok',
 //           },
-//           source: 'OPENMEMORY_CHROME_EXTENSION',
+//           source: 'REMEMBERME_CHROME_EXTENSION',
 //           ...optionalParams,
 //         };
 
@@ -293,16 +320,16 @@ function setInputValue(inputElement: HTMLTextAreaElement | null, value: string):
 //   let sendButton = null;
 //   for (const selector of selectors) {
 //     sendButton = document.querySelector(selector);
-//     if (sendButton && !sendButton.dataset.mem0Listener) {
-//       sendButton.dataset.mem0Listener = 'true';
+//     if (sendButton && !sendButton.dataset.remembermeListener) {
+//       sendButton.dataset.remembermeListener = 'true';
 //       sendButton.addEventListener('click', function () {
 //         captureAndStoreMemory();
 //       });
 
 //       // Also handle textarea for Enter key press
 //       const textarea = getTextarea();
-//       if (textarea && !textarea.dataset.mem0KeyListener) {
-//         textarea.dataset.mem0KeyListener = 'true';
+//       if (textarea && !textarea.dataset.remembermeKeyListener) {
+//         textarea.dataset.remembermeKeyListener = 'true';
 //         textarea.addEventListener('keydown', function (event: KeyboardEvent) {
 //           // Check if Enter was pressed without Shift (standard send behavior)
 //           if (event.key === 'Enter' && !event.shiftKey) {
@@ -320,174 +347,99 @@ function initializeMem0Integration(): void {
   setupInputObserver();
   hookGrokBackgroundSearchTyping(); 
 
+  // COMMENTED OUT: Icon button injection - using notification-only approach
+  // COMMENTED OUT: Icon button injection - using notification-only approach
   // Set up mutation observer to reinject elements when DOM changes
   // Cache-first mount (before focus)
   try {
-    if (!document.getElementById('mem0-icon-button') && OPENMEMORY_UI) {
-      OPENMEMORY_UI.resolveCachedAnchor(
-        { learnKey: location.host + ':' + location.pathname },
-        null,
-        24 * 60 * 60 * 1000
-      ).then(function (hit) {
-        if (!hit || !hit.el) {
-          return;
-        }
-        let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
-        let host = hs.host,
-          shadow = hs.shadow;
-        host.id = 'mem0-icon-button';
-        const cfg =
-          typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok ? SITE_CONFIG.grok : null;
-        let placement = hit.placement ||
-          (cfg && cfg.placement) || { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' };
-        OPENMEMORY_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
-
-        let style = document.createElement('style');
-        style.textContent = `
-          :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-          .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-          :host([data-has-text="1"]) .dot { display:block; }
-        `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-
-        // Try to move immediately to the right of the "Auto" button
-        try {
-          let anchor = hit.el;
-          const cfg =
-            typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok ? SITE_CONFIG.grok : null;
-          let autoBtn = Array.from(anchor.querySelectorAll('button,[role="button"]')).find(
-            function (b: Element) {
-              let txt = (b.textContent || '').trim();
-              return cfg && cfg.autoButtonTextPattern
-                ? cfg.autoButtonTextPattern.test(txt)
-                : /\bAuto\b/i.test(txt);
-            }
-          );
-          if (autoBtn) {
-            let child: Element | null = autoBtn;
-            while (child && child.parentElement !== anchor) {
-              child = child.parentElement;
-            }
-            if (child && child.parentElement === anchor && anchor) {
-              anchor.insertBefore(host, child.nextSibling);
-              let gap = getComputedStyle(anchor).gap;
-              if (!gap || gap === 'normal') {
-                gap = '4px';
-              }
-              host.style.marginLeft = gap;
-              host.style.marginRight = '0';
-              host.style.display = 'inline-flex';
-              host.style.alignItems = 'center';
-              host.style.flexShrink = '0';
-            }
-          }
-        } catch {
-          // Ignore errors during re-initialization
-        }
-      });
-    }
+    // if (!document.getElementById('rememberme-icon-button') && REMEMBERME_UI) {
+    //   REMEMBERME_UI.resolveCachedAnchor(
+    //     { learnKey: location.host + ':' + location.pathname },
+    //     null,
+    //     24 * 60 * 60 * 1000
+    //   ).then(function (hit) {
+    //     if (!hit || !hit.el) {
+    //       return;
+    //     }
+    //     let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
+    //     let host = hs.host,
+    //       shadow = hs.shadow;
+    //     host.id = 'rememberme-icon-button';
+    //     const cfg =
+    //       typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok ? SITE_CONFIG.grok : null;
+    //     let placement = hit.placement ||
+    //       (cfg && cfg.placement) || { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' };
+    //     REMEMBERME_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
+    //
+    //     let style = document.createElement('style');
+    //     style.textContent = `
+    //       :host { position: relative; }
+    //       .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+    //       .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+    //       .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+    //       :host([data-has-text="1"]) .dot { display:block; }
+    //     `;
+    //     let btn = document.createElement('button');
+    //     btn.className = 'rememberme-btn';
+    //     let img = document.createElement('img');
+    //     img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+    //     let dot = document.createElement('div');
+    //     dot.className = 'dot';
+    //     btn.appendChild(img);
+    //     shadow.append(style, btn, dot);
+    //     btn.addEventListener('click', function () {
+    //       handleRememberMeModal();
+    //     });
+    //     if (typeof updateNotificationDot === 'function') {
+    //       setTimeout(updateNotificationDot, 0);
+    //     }
+    //
+    //     // Try to move immediately to the right of the "Auto" button
+    //     try {
+    //       let anchor = hit.el;
+    //       const cfg =
+    //         typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok ? SITE_CONFIG.grok : null;
+    //       let autoBtn = Array.from(anchor.querySelectorAll('button,[role="button"]')).find(
+    //         function (b: Element) {
+    //           let txt = (b.textContent || '').trim();
+    //           return cfg && cfg.autoButtonTextPattern
+    //             ? cfg.autoButtonTextPattern.test(txt)
+    //             : /\bAuto\b/i.test(txt);
+    //         }
+    //       );
+    //       if (autoBtn) {
+    //         let child: Element | null = autoBtn;
+    //         while (child && child.parentElement !== anchor) {
+    //           child = child.parentElement;
+    //         }
+    //         if (child && child.parentElement === anchor && anchor) {
+    //           anchor.insertBefore(host, child.nextSibling);
+    //           let gap = getComputedStyle(anchor).gap;
+    //           if (!gap || gap === 'normal') {
+    //             gap = '4px';
+    //           }
+    //           host.style.marginLeft = gap;
+    //           host.style.marginRight = '0';
+    //           host.style.display = 'inline-flex';
+    //           host.style.alignItems = 'center';
+    //           host.style.flexShrink = '0';
+    //         }
+    //       }
+    //     } catch {
+    //       // Ignore errors during re-initialization
+    //     }
+    //   });
+    // }
   } catch {
     // Ignore errors during re-initialization
   }
 
-  // Focus-driven mount
-  if (OPENMEMORY_UI && OPENMEMORY_UI.mountOnEditorFocus) {
-    OPENMEMORY_UI.mountOnEditorFocus({
-      existingHostSelector: '#mem0-icon-button',
-      editorSelector:
-        typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok && SITE_CONFIG.grok.editorSelector
-          ? SITE_CONFIG.grok.editorSelector
-          : 'textarea, [contenteditable="true"], input[type="text"]',
-      deriveAnchor:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.grok &&
-        typeof SITE_CONFIG.grok.deriveAnchor === 'function'
-          ? SITE_CONFIG.grok.deriveAnchor
-          : function (editor: Element) {
-              return editor.closest('form') || editor.parentElement || document.body;
-            },
-      placement:
-        typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.grok && SITE_CONFIG.grok.placement
-          ? SITE_CONFIG.grok.placement
-          : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-      render: function (shadow: ShadowRoot, host: HTMLElement, anchor: Element | null) {
-        host.id = 'mem0-icon-button';
-        let style = document.createElement('style');
-        style.textContent = `
-          :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-          .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-          :host([data-has-text="1"]) .dot { display:block; }
-        `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-
-        // Move host to immediately after the "Auto" button if present and normalize spacing
-        try {
-          let autoBtn =
-            anchor &&
-            Array.from(anchor.querySelectorAll('button,[role="button"]')).find(function (
-              b: Element
-            ) {
-              return /\bAuto\b/i.test((b.textContent || '').trim());
-            });
-          if (autoBtn) {
-            let child: Element | null = autoBtn;
-            while (child && child.parentElement !== anchor) {
-              child = child.parentElement;
-            }
-            if (child && child.parentElement === anchor && anchor) {
-              anchor.insertBefore(host, child.nextSibling);
-              // Use container gap for spacing; don't add extra margin to avoid double spacing
-              host.style.marginLeft = '0';
-              // Rely on container gap; no additional margin
-              host.style.marginLeft = '0';
-              host.style.marginRight = '0';
-              host.style.display = 'inline-flex';
-              host.style.alignItems = 'center';
-              host.style.flexShrink = '0';
-            }
-          }
-        } catch {
-          // Ignore errors during re-initialization
-        }
-      },
-    });
-  }
 
   document.addEventListener('keydown', function (event: KeyboardEvent) {
     if (event.ctrlKey && event.key === 'm') {
       event.preventDefault();
       (async () => {
-        await handleMem0Modal();
+        await handleRememberMeModal();
       })();
     }
   });
@@ -512,7 +464,7 @@ function initializeMem0Integration(): void {
 
 //     // Check if our button already exists
 //     if (
-//       document.querySelector('button[aria-label="OpenMemory"]') ||
+//       document.querySelector('button[aria-label="RememberMe"]') ||
 //       document.querySelector('#mem0-button-container')
 //     ) {
 //       return;
@@ -558,37 +510,37 @@ function initializeMem0Integration(): void {
 //     }
 
 //     // Create mem0 button container
-//     const mem0ButtonContainer = document.createElement('div');
-//     mem0ButtonContainer.id = 'mem0-button-container';
-//     mem0ButtonContainer.style.position = 'relative'; // For positioning popover
-//     mem0ButtonContainer.style.marginLeft = '4px'; // Smaller margin to be closer to Auto button
-//     mem0ButtonContainer.style.display = 'flex';
-//     mem0ButtonContainer.style.alignItems = 'center'; // Ensure vertical alignment
+//     const remembermeButtonContainer = document.createElement('div');
+//     remembermeButtonContainer.id = 'mem0-button-container';
+//     remembermeButtonContainer.style.position = 'relative'; // For positioning popover
+//     remembermeButtonContainer.style.marginLeft = '4px'; // Smaller margin to be closer to Auto button
+//     remembermeButtonContainer.style.display = 'flex';
+//     remembermeButtonContainer.style.alignItems = 'center'; // Ensure vertical alignment
 
 //     // Create mem0 button
-//     const mem0Button = document.createElement('button');
-//     mem0Button.className = referenceButton.className;
-//     mem0Button.setAttribute('type', 'button');
-//     mem0Button.setAttribute('tabindex', '0');
-//     mem0Button.setAttribute('aria-pressed', 'false');
-//     mem0Button.setAttribute('aria-label', 'OpenMemory');
-//     mem0Button.setAttribute('data-state', 'closed');
-//     mem0Button.id = 'mem0-icon-button';
+//     const remembermeButton = document.createElement('button');
+//     remembermeButton.className = referenceButton.className;
+//     remembermeButton.setAttribute('type', 'button');
+//     remembermeButton.setAttribute('tabindex', '0');
+//     remembermeButton.setAttribute('aria-pressed', 'false');
+//     remembermeButton.setAttribute('aria-label', 'OpenMemory');
+//     remembermeButton.setAttribute('data-state', 'closed');
+//     remembermeButton.id = 'rememberme-icon-button';
 
 //     // Add additional styling to match the Auto button better
-//     mem0Button.style.minWidth = 'auto';
-//     mem0Button.style.padding = '0';
-//     mem0Button.style.width = '32px';
-//     mem0Button.style.height = '32px';
-//     mem0Button.style.display = 'flex';
-//     mem0Button.style.alignItems = 'center';
-//     mem0Button.style.justifyContent = 'center';
-//     mem0Button.style.flexShrink = '0'; // Prevent shrinking
-//     mem0Button.style.margin = '0'; // Reset any inherited margins
+//     remembermeButton.style.minWidth = 'auto';
+//     remembermeButton.style.padding = '0';
+//     remembermeButton.style.width = '32px';
+//     remembermeButton.style.height = '32px';
+//     remembermeButton.style.display = 'flex';
+//     remembermeButton.style.alignItems = 'center';
+//     remembermeButton.style.justifyContent = 'center';
+//     remembermeButton.style.flexShrink = '0'; // Prevent shrinking
+//     remembermeButton.style.margin = '0'; // Reset any inherited margins
 
 //     // Create notification dot
 //     const notificationDot = document.createElement('div');
-//     notificationDot.id = 'mem0-notification-dot';
+//     notificationDot.id = 'rememberme-notification-dot';
 //     notificationDot.style.cssText = `
 //       position: absolute;
 //       top: -2px;
@@ -614,7 +566,7 @@ function initializeMem0Integration(): void {
 //           100% { transform: scale(1); }
 //         }
 
-//         #mem0-notification-dot.active {
+//         #rememberme-notification-dot.active {
 //           display: block !important;
 //           animation: popIn 0.3s ease-out forwards;
 //         }
@@ -623,8 +575,8 @@ function initializeMem0Integration(): void {
 //     }
 
 //     // Create button content - icon only, similar to Claude style
-//     mem0Button.innerHTML = `
-//       <img src="${chrome.runtime.getURL('icons/mem0-claude-icon-p.png')}"
+//     remembermeButton.innerHTML = `
+//       <img src="${chrome.runtime.getURL('icons/rememberme-icon.png')}"
 //       width="18" height="18" style="display: block;">
 //     `;
 
@@ -666,22 +618,22 @@ function initializeMem0Integration(): void {
 //     popover.appendChild(arrow);
 
 //     // Add hover event for popover
-//     mem0ButtonContainer.addEventListener('mouseenter', () => {
+//     remembermeButtonContainer.addEventListener('mouseenter', () => {
 //       popover.style.display = 'block';
 //       setTimeout(() => (popover.style.opacity = '1'), 10);
 //     });
 
-//     mem0ButtonContainer.addEventListener('mouseleave', () => {
+//     remembermeButtonContainer.addEventListener('mouseleave', () => {
 //       popover.style.opacity = '0';
 //       setTimeout(() => (popover.style.display = 'none'), 200);
 //     });
 
 //     // Add click event to the mem0 button to show memory modal
-//     mem0Button.addEventListener('click', function () {
+//     remembermeButton.addEventListener('click', function () {
 //       // Check if the memories are enabled
 //       getMemoryEnabledState().then(memoryEnabled => {
 //         if (memoryEnabled) {
-//           handleMem0Modal();
+//           handleRememberMeModal();
 //         } else {
 //           // If memories are disabled, open options
 //           chrome.runtime.sendMessage({ action: SidebarAction.OPEN_OPTIONS });
@@ -690,12 +642,12 @@ function initializeMem0Integration(): void {
 //     });
 
 //     // Assemble button components
-//     mem0ButtonContainer.appendChild(mem0Button);
-//     mem0ButtonContainer.appendChild(notificationDot);
-//     mem0ButtonContainer.appendChild(popover);
+//     remembermeButtonContainer.appendChild(remembermeButton);
+//     remembermeButtonContainer.appendChild(notificationDot);
+//     remembermeButtonContainer.appendChild(popover);
 
 //     // Insert after the Auto button (or reference button if Auto not found)
-//     parentDiv.insertBefore(mem0ButtonContainer, referenceButton.nextSibling);
+//     parentDiv.insertBefore(remembermeButtonContainer, referenceButton.nextSibling);
 
 //     // Update notification dot based on input content
 //     updateNotificationDot();
@@ -727,7 +679,7 @@ function initializeMem0Integration(): void {
 // Function to update notification dot visibility based on text in the input
 function updateNotificationDot(): void {
   const textarea = getTextarea();
-  const host = document.getElementById('mem0-icon-button');
+  const host = document.getElementById('rememberme-icon-button');
 
   if (textarea && host) {
     // Function to check if input has text
@@ -776,13 +728,13 @@ function createMemoryModal(memoryItems: MemoryItem[], isLoading: boolean = false
     leftPosition = modalPosition.x;
     topPosition = modalPosition.y;
   } else {
-    // Position relative to the OpenMemory button
-    const mem0Button =
-      document.getElementById('mem0-icon-button') ||
-      document.querySelector('button[aria-label="OpenMemory"]');
+    // Position relative to the RememberMe button
+    const remembermeButton =
+      document.getElementById('rememberme-icon-button') ||
+      document.querySelector('button[aria-label="RememberMe"]');
 
-    if (mem0Button) {
-      const buttonRect = mem0Button.getBoundingClientRect();
+    if (remembermeButton) {
+      const buttonRect = remembermeButton.getBoundingClientRect();
 
       // Determine if there's enough space below the button
       const viewportHeight = window.innerHeight;
@@ -844,92 +796,94 @@ function createMemoryModal(memoryItems: MemoryItem[], isLoading: boolean = false
     }
   });
 
+  // COMMENTED OUT: Icon button injection - using notification-only approach
   // Cache-first mount for Grok (aim to sit left of the send/auto area)
-  try {
-    if (!document.getElementById('mem0-icon-button') && OPENMEMORY_UI) {
-      OPENMEMORY_UI.resolveCachedAnchor(
-        { learnKey: location.host + ':' + location.pathname },
-        null,
-        24 * 60 * 60 * 1000
-      ).then(function (hit: { el: Element; placement: Placement | null } | null) {
-        if (!hit || !hit.el) {
-          return;
-        }
-        let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
-        let host = hs.host,
-          shadow = hs.shadow;
-        host.id = 'mem0-icon-button';
-        let placement = hit.placement || {
-          strategy: 'inline',
-          where: 'beforeend',
-          inlineAlign: 'end',
-        };
-        OPENMEMORY_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
+  // try {
+  //   if (!document.getElementById('rememberme-icon-button') && REMEMBERME_UI) {
+  //     REMEMBERME_UI.resolveCachedAnchor(
+  //       { learnKey: location.host + ':' + location.pathname },
+  //       null,
+  //       24 * 60 * 60 * 1000
+  //     ).then(function (hit: { el: Element; placement: Placement | null } | null) {
+  //       if (!hit || !hit.el) {
+  //         return;
+  //       }
+  //       let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
+  //       let host = hs.host,
+  //         shadow = hs.shadow;
+  //       host.id = 'rememberme-icon-button';
+  //       let placement = hit.placement || {
+  //         strategy: 'inline',
+  //         where: 'beforeend',
+  //         inlineAlign: 'end',
+  //       };
+  //       REMEMBERME_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
+  //
+  //       let style = document.createElement('style');
+  //       style.textContent = `
+  //           :host { position: relative; }
+  //           .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+  //           .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+  //           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+  //           :host([data-has-text="1"]) .dot { display:block; }
+  //         `;
+  //       let btn = document.createElement('button');
+  //       btn.className = 'rememberme-btn';
+  //       let img = document.createElement('img');
+  //       img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+  //       let dot = document.createElement('div');
+  //       dot.className = 'dot';
+  //       btn.appendChild(img);
+  //       shadow.append(style, btn, dot);
+  //       btn.addEventListener('click', function () {
+  //         handleRememberMeModal();
+  //       });
+  //       if (typeof updateNotificationDot === 'function') {
+  //         setTimeout(updateNotificationDot, 0);
+  //       }
+  //     });
+  //   }
+  // } catch (_) {
+  //   // Ignore errors during re-initialization
+  // }
 
-        let style = document.createElement('style');
-        style.textContent = `
-            :host { position: relative; }
-            .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-            .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-            .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-            :host([data-has-text="1"]) .dot { display:block; }
-          `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-      });
-    }
-  } catch (_) {
-    // Ignore errors during re-initialization
-  }
-
+  // COMMENTED OUT: Icon button injection - using notification-only approach
   // Focus-driven mount for Grok
-  if (OPENMEMORY_UI && OPENMEMORY_UI.mountOnEditorFocus) {
-    OPENMEMORY_UI.mountOnEditorFocus({
-      existingHostSelector: '#mem0-icon-button',
-      editorSelector: 'textarea, [contenteditable="true"], input[type="text"]',
-      deriveAnchor: function (editor: Element) {
-        return editor.closest('form') || editor.parentElement;
-      },
-      placement: { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-      render: function (shadow: ShadowRoot, host: HTMLElement) {
-        host.id = 'mem0-icon-button';
-        let style = document.createElement('style');
-        style.textContent = `
-          :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-          .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-          :host([data-has-text="1"]) .dot { display:block; }
-        `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-      },
-    });
-  }
+  // if (false && REMEMBERME_UI && REMEMBERME_UI.mountOnEditorFocus) {
+  //   REMEMBERME_UI.mountOnEditorFocus({
+  //     existingHostSelector: '#rememberme-icon-button',
+  //     editorSelector: 'textarea, [contenteditable="true"], input[type="text"]',
+  //     deriveAnchor: function (editor: Element) {
+  //       return editor.closest('form') || editor.parentElement;
+  //     },
+  //     placement: { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
+  //     render: function (shadow: ShadowRoot, host: HTMLElement) {
+  //       host.id = 'rememberme-icon-button';
+  //       let style = document.createElement('style');
+  //       style.textContent = `
+  //         :host { position: relative; }
+  //         .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+  //         .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+  //         .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+  //         :host([data-has-text="1"]) .dot { display:block; }
+  //       `;
+  //       let btn = document.createElement('button');
+  //       btn.className = 'rememberme-btn';
+  //       let img = document.createElement('img');
+  //       img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+  //       let dot = document.createElement('div');
+  //       dot.className = 'dot';
+  //       btn.appendChild(img);
+  //       shadow.append(style, btn, dot);
+  //       btn.addEventListener('click', function () {
+  //         handleRememberMeModal();
+  //       });
+  //       if (typeof updateNotificationDot === 'function') {
+  //         setTimeout(updateNotificationDot, 0);
+  //       }
+  //     },
+  //   });
+  // }
 
   // Create modal container with positioning
   const modalContainer = document.createElement('div');
@@ -1025,16 +979,16 @@ function createMemoryModal(memoryItems: MemoryItem[], isLoading: boolean = false
 
   // Add Mem0 logo (updated to SVG)
   const logoImg = document.createElement('img');
-  logoImg.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logoImg.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logoImg.style.cssText = `
     width: 26px;
     height: 26px;
     border-radius: 50%;
   `;
 
-  // Add "OpenMemory" title
+  // Add "RememberMe" title
   const title = document.createElement('div');
-  title.textContent = 'OpenMemory';
+  title.textContent = 'RememberMe';
   title.style.cssText = `
     font-size: 16px;
     font-weight: 600;
@@ -1362,7 +1316,7 @@ function createMemoryModal(memoryItems: MemoryItem[], isLoading: boolean = false
 
         sendExtensionEvent('memory_injection', {
           provider: 'grok',
-          source: 'OPENMEMORY_CHROME_EXTENSION',
+          source: 'REMEMBERME_CHROME_EXTENSION',
           browser: getBrowser(),
           injected_all: false,
           memory_id: memory.id,
@@ -1708,7 +1662,7 @@ function createMemoryModal(memoryItems: MemoryItem[], isLoading: boolean = false
 
     sendExtensionEvent('memory_injection', {
       provider: 'grok',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
       injected_all: true,
       memory_count: newMemories.length,
@@ -1758,7 +1712,7 @@ function updateInputWithMemories() {
     const baseContent = getContentWithoutMemories();
 
     // Create the memory string with all collected memories
-    let memoriesContent = '\n\n' + OPENMEMORY_PROMPTS.memory_header_text + '\n';
+    let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
     // Add all memories to the content
     allMemories.forEach((mem, index) => {
       memoriesContent += `- ${mem}`;
@@ -1783,7 +1737,7 @@ function getContentWithoutMemories(): string {
   let content: string = inputElement.value || '';
 
   // Remove any memory headers and content
-  const memoryPrefix = OPENMEMORY_PROMPTS.memory_header_text;
+  const memoryPrefix = REMEMBERME_PROMPTS.memory_header_text;
   const prefixIndex = content.indexOf(memoryPrefix);
   if (prefixIndex !== -1) {
     content = content.substring(0, prefixIndex).trim();
@@ -1791,8 +1745,8 @@ function getContentWithoutMemories(): string {
 
   // Also try with regex pattern
   try {
-    const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-    content = content.replace(MEM0_PLAIN, '').trim();
+    const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+    content = content.replace(REMEMBERME_PLAIN, '').trim();
   } catch {
     // Ignore regex errors
   }
@@ -1810,24 +1764,15 @@ function getMemoryEnabledState(): Promise<boolean> {
 }
 
 // Handler for the modal approach
-async function handleMem0Modal() {
+async function handleRememberMeModal() {
   const memoryEnabled = await getMemoryEnabledState();
   if (!memoryEnabled) {
     return;
   }
 
-  // Check if user is logged in
-  const loginData = await new Promise<StorageItems>(resolve => {
-    chrome.storage.sync.get(
-      [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
-      function (items) {
-        resolve(items as StorageItems);
-      }
-    );
-  });
-
-  // If no API key and no access token, show login popup
-  if (!loginData.apiKey && !loginData.access_token) {
+  // Check if user is logged in (Supabase or legacy)
+  const hasAuth = await hasValidAuth();
+  if (!hasAuth) {
     showLoginPopup();
     return;
   }
@@ -1838,11 +1783,11 @@ async function handleMem0Modal() {
   // If no message, show a popup and return
   if (!message) {
     // Show message that requires input
-    const mem0Button = document.querySelector(
-      'button[aria-label="OpenMemory"]'
+    const remembermeButton = document.querySelector(
+      'button[aria-label="RememberMe"]'
     ) as HTMLElement | null;
-    if (mem0Button) {
-      showButtonPopup(mem0Button, 'Please enter some text first');
+    if (remembermeButton) {
+      showButtonPopup(remembermeButton, 'Please enter some text first');
     }
     return;
   }
@@ -1850,11 +1795,11 @@ async function handleMem0Modal() {
   // Clean the message of any existing memory content
   message = getContentWithoutMemories();
 
-  if (isProcessingMem0) {
+  if (isProcessingRememberMe) {
     return;
   }
 
-  isProcessingMem0 = true;
+  isProcessingRememberMe = true;
 
   // Show the loading modal immediately with the source button ID
   createMemoryModal([], true);
@@ -1863,12 +1808,8 @@ async function handleMem0Modal() {
     const data = await new Promise<StorageItems>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.SIMILARITY_THRESHOLD,
           StorageKey.TOP_K,
         ],
@@ -1878,32 +1819,36 @@ async function handleMem0Modal() {
       );
     });
 
-    const apiKey = data[StorageKey.API_KEY];
-    const userId = (data[StorageKey.USER_ID_CAMEL] ||
-      data[StorageKey.USER_ID] ||
-      'chrome-extension-user') as string;
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    if (!apiKey && !accessToken) {
-      isProcessingMem0 = false;
+    const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+    const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+    if (!supabaseAccessToken || !supabaseUserId) {
+      isProcessingRememberMe = false;
       return;
     }
 
     sendExtensionEvent('modal_clicked', {
       provider: 'grok',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
     });
 
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      console.error('[Grok] VITE_MEM0_API_KEY not configured');
+      return;
+    }
+    const authHeader = `Token ${apiKey}`;
 
     const messages = [{ role: MessageRole.User, content: message }];
 
     const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+    const orgId = getOrgId();
+    const projectId = getProjectId();
+    if (orgId) {
+      optionalParams.org_id = orgId;
     }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+    if (projectId) {
+      optionalParams.project_id = projectId;
     }
 
     try {
@@ -1923,12 +1868,12 @@ async function handleMem0Modal() {
       },
       body: JSON.stringify({
         messages: messages,
-        user_id: userId,
+        user_id: supabaseUserId,
         infer: true,
         metadata: {
           provider: 'Grok',
         },
-        source: 'OPENMEMORY_CHROME_EXTENSION',
+        version: 'v2',
         ...optionalParams,
       }),
     }).catch(error => {
@@ -1939,20 +1884,20 @@ async function handleMem0Modal() {
     // Still show the modal but with empty state if there was an error
     createMemoryModal([], false);
   } finally {
-    isProcessingMem0 = false;
+    isProcessingRememberMe = false;
   }
 }
 
 // Function to show a small popup message near the button
 function showButtonPopup(button: HTMLElement, message: string): void {
   // Remove any existing popups
-  const existingPopup = document.querySelector('.mem0-button-popup');
+  const existingPopup = document.querySelector('.rememberme-button-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   const popup = document.createElement('div');
-  popup.className = 'mem0-button-popup';
+  popup.className = 'rememberme-button-popup';
 
   popup.style.cssText = `
     position: absolute;
@@ -2003,14 +1948,14 @@ function showButtonPopup(button: HTMLElement, message: string): void {
 // Function to show login popup
 function showLoginPopup(): void {
   // First remove any existing popups
-  const existingPopup = document.querySelector('#mem0-login-popup');
+  const existingPopup = document.querySelector('#rememberme-login-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   // Create popup container
   const popupOverlay = document.createElement('div');
-  popupOverlay.id = 'mem0-login-popup';
+  popupOverlay.id = 'rememberme-login-popup';
   popupOverlay.style.cssText = `
     position: fixed;
     top: 0;
@@ -2062,7 +2007,7 @@ function showLoginPopup(): void {
   `;
 
   const logo = document.createElement('img');
-  logo.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logo.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logo.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2071,7 +2016,7 @@ function showLoginPopup(): void {
   `;
 
   const logoDark = document.createElement('img');
-  logoDark.src = chrome.runtime.getURL('icons/mem0-icon-black.png');
+  logoDark.src = chrome.runtime.getURL('icons/rememberme-icon.png');
   logoDark.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2080,7 +2025,7 @@ function showLoginPopup(): void {
   `;
 
   const heading = document.createElement('h2');
-  heading.textContent = 'Sign in to OpenMemory';
+  heading.textContent = 'Sign in to RememberMe';
   heading.style.cssText = `
     margin: 0;
     font-size: 18px;

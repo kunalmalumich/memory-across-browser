@@ -1,25 +1,33 @@
 {
   "manifest_version": 3,
-  "name": "OpenMemory",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtzrQH64kdVaO4r7sASIqn0y7Kricu7xjE/my6QMDF2tAb8fMXj5PhG2+OOytQ12rVNB1dXNqwPqd0TlYo+UY5+kXNcthIZ5Dw4f1wYC1QyloenUMU8+RODvhLKxo/A1h+6NsON2V6Ti0LbW4mskNZGxnDVltHuDskST2Haq6HF32PJqZ5QNsUdBQABPz24wgmaDGS9supRz1C49+Wd7zgxpQYTjp28iS4oMYB2U6onCdSolO6VCuqf4tTIGB4IPcCLHVyWOK/BjqZETOcdI/41DAyr0a3cneqgJA5ytqAn4wcChCQwuvV9xeNFb7tPcXnhUmf7so30+CsSqG0PxwnwIDAQAB",
+  "name": "RememberMe",
   "version": "1.3.17",
-  "description": "🧠 OpenMemory keeps your conversations in sync. 🔄 No more repeating yourself—just seamless AI collaboration! ✨",
+  "description": "🧠 RememberMe keeps your conversations in sync. 🔄 No more repeating yourself—just seamless AI collaboration! ✨",
   "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "icons/rememberme-icon16.png",
+    "48": "icons/rememberme-icon48.png",
+    "128": "icons/rememberme-icon128.png"
   },
   "permissions": ["storage", "activeTab", "contextMenus", "scripting", "webNavigation"],
   "host_permissions": [
     "https://api.mem0.ai/*",
     "https://app.mem0.ai/*",
-    "https://claude.ai/*"
+    "https://claude.ai/*",
+    "https://*.supabase.co/*",
+    "https://*.replit.dev/*"
   ],
+  "externally_connectable": {
+    "matches": [
+      "https://*.replit.dev/*"
+    ]
+  },
   "action": {
     "default_popup": "src/popup.html",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/rememberme-icon16.png",
+      "48": "icons/rememberme-icon48.png",
+      "128": "icons/rememberme-icon128.png"
     }
   },
   "background": {
@@ -79,7 +87,9 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/*"],
+      "resources": [
+        "icons/*"
+      ],
       "matches": ["<all_urls>"]
     }
   ]

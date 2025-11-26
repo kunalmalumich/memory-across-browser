@@ -10,7 +10,7 @@ function fetchAndSaveSession() {
         //Track successful login
         sendExtensionEvent('login_success', {
           browser: getBrowser(),
-          source: 'OPENMEMORY_CHROME_EXTENSION',
+          source: 'REMEMBERME_CHROME_EXTENSION',
         });
       }
     })

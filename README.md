@@ -29,7 +29,24 @@ https://github.com/user-attachments/assets/a069a178-631e-4b35-a182-9f4fef7735c4
 
 ## Installation
 
-> **Note:** Make sure you have [Node.js](https://nodejs.org/) installed before proceeding.
+> **Note:** This project requires Node.js 20.19+ or 22.12+. We recommend using [nvm](https://github.com/nvm-sh/nvm) to manage Node.js versions.
+
+### Prerequisites
+
+1. Install [nvm](https://github.com/nvm-sh/nvm) (Node Version Manager) if you haven't already:
+   ```bash
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+   ```
+
+2. Install and use the correct Node.js version:
+   ```bash
+   nvm install 20
+   nvm use 20
+   ```
+   
+   Or simply run `nvm use` in the project directory (it will automatically use the version specified in `.nvmrc`).
+
+### Build Steps
 
 1. Clone this repository.
 2. Navigate to the directory where you cloned the repository.

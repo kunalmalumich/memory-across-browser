@@ -1,18 +1,30 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
-import { DEFAULT_USER_ID, type LoginData, MessageRole } from '../types/api';
+import { MessageRole } from '../types/api';
 import type { HistoryStateData } from '../types/browser';
 import type { MemoryItem, MemorySearchItem, OptionalApiParams } from '../types/memory';
 import { SidebarAction } from '../types/messages';
 import { type StorageData, StorageKey } from '../types/storage';
-import { createOrchestrator, type SearchStorage } from '../utils/background_search';
-import { OPENMEMORY_PROMPTS } from '../utils/llm_prompts';
+import { REMEMBERME_PROMPTS } from '../utils/llm_prompts';
 import { SITE_CONFIG } from '../utils/site_config';
-import { getBrowser, sendExtensionEvent } from '../utils/util_functions';
-import { OPENMEMORY_UI } from '../utils/util_positioning';
+import {
+  getBrowser,
+  sendExtensionEvent,
+  hasValidAuth,
+  getOrgId,
+  getProjectId,
+  getApiKey,
+} from '../utils/util_functions';
+import { REMEMBERME_UI } from '../utils/util_positioning';
+import {
+  createPlatformSearchOrchestrator,
+  setupBackgroundSearchHook,
+  addMemoryToMem0,
+  type PlatformConfig,
+} from '../utils/content_script_common';
 
 export {};
 
-let isProcessingMem0: boolean = false;
+let isProcessingRememberMe: boolean = false;
 
 // Initialize the MutationObserver variable
 let observer: MutationObserver;
@@ -34,101 +46,32 @@ let inputValueCopy: string = '';
 
 let currentModalSourceButtonId: string | null = null;
 
-const chatgptSearch = createOrchestrator({
-  fetch: async function (query: string, opts: { signal?: AbortSignal }) {
-    const data = await new Promise<SearchStorage>(resolve => {
-      chrome.storage.sync.get(
-        [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
-          StorageKey.SIMILARITY_THRESHOLD,
-          StorageKey.TOP_K,
-        ],
-        function (items) {
-          resolve(items as SearchStorage);
-        }
-      );
-    });
-
-    const apiKey = data[StorageKey.API_KEY];
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    if (!apiKey && !accessToken) {
-      return [];
-    }
-
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
-    const userId =
-      data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
-    const threshold =
-      data[StorageKey.SIMILARITY_THRESHOLD] !== undefined
-        ? data[StorageKey.SIMILARITY_THRESHOLD]
-        : 0.1;
-    const topK = data[StorageKey.TOP_K] !== undefined ? data[StorageKey.TOP_K] : 10;
-
-    const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
-    }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
-    }
-
-    const payload = {
-      query,
-      filters: { user_id: userId },
-      rerank: true,
-      threshold: threshold,
-      top_k: topK,
-      filter_memories: false,
-      source: 'OPENMEMORY_CHROME_EXTENSION',
-      ...optionalParams,
-    };
-
-    const res = await fetch('https://api.mem0.ai/v2/memories/search/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: authHeader,
-      },
-      body: JSON.stringify(payload),
-      signal: opts && opts.signal,
-    });
-
-    if (!res.ok) {
-      throw new Error(`API request failed with status ${res.status}`);
-    }
-    return await res.json();
+// Platform configuration
+const chatgptConfig: PlatformConfig = {
+  provider: 'ChatGPT',
+  inputSelectors: ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea'],
+  sendButtonSelectors: [],
+  backgroundSearchHookAttribute: 'mem0BackgroundHooked',
+  getInputValue: (element: HTMLElement | null) => {
+    if (!element) return '';
+    return element.textContent || (element as HTMLTextAreaElement)?.value || '';
   },
-
-  // Don't render on prefetch. When modal is open, update it.
-  onSuccess: function (normQuery: string, responseData: MemorySearchItem[]) {
-    if (!memoryModalShown) {
-      return;
-    }
-    const memoryItems = ((responseData as MemorySearchItem[]) || []).map(
-      (item: MemorySearchItem) => ({
-        id: String(item.id),
-        text: item.memory,
-        categories: item.categories || [],
-      })
-    );
-    createMemoryModal(memoryItems, false, currentModalSourceButtonId);
+  getContentWithoutMemories: (text?: string) => {
+    if (typeof text === 'string') return text;
+    return getContentWithoutMemories();
   },
-
-  onError: function () {
-    if (memoryModalShown) {
-      createMemoryModal([], false, currentModalSourceButtonId);
-    }
+  createMemoryModal: (items, isLoading, sourceButtonId) => {
+    currentModalSourceButtonId = sourceButtonId;
+    createMemoryModal(items, isLoading, sourceButtonId);
   },
+  onMemoryModalShown: (shown) => {
+    memoryModalShown = shown;
+  },
+  getLastMessages: getLastMessages,
+  logPrefix: 'ChatGPT',
+};
 
-  minLength: 3,
-  debounceMs: 75,
-  cacheTTL: 60000,
-});
+const chatgptSearch = createPlatformSearchOrchestrator(chatgptConfig);
 
 function createMemoryModal(
   memoryItems: MemoryItem[],
@@ -155,9 +98,9 @@ function createMemoryModal(
   if (draggedPosition) {
     topPosition = draggedPosition.top;
     leftPosition = draggedPosition.left;
-  } else if (sourceButtonId === 'mem0-icon-button') {
-    // Position relative to the mem0-icon-button (in the input area)
-    const iconButton = document.querySelector('#mem0-icon-button');
+  } else if (sourceButtonId === 'rememberme-icon-button') {
+    // Position relative to the rememberme-icon-button (in the input area)
+    const iconButton = document.querySelector('#rememberme-icon-button');
     if (iconButton) {
       const buttonRect = iconButton.getBoundingClientRect();
 
@@ -323,7 +266,7 @@ function createMemoryModal(
 
   // Add Mem0 logo (updated to SVG)
   const logoImg = document.createElement('img');
-  logoImg.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logoImg.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logoImg.style.cssText = `
     width: 26px;
     height: 26px;
@@ -331,9 +274,9 @@ function createMemoryModal(
     margin-right: 8px;
   `;
 
-  // Add "OpenMemory" title
+  // Add "RememberMe" title
   const title = document.createElement('div');
-  title.textContent = 'OpenMemory';
+  title.textContent = 'RememberMe';
   title.style.cssText = `
     font-size: 16px;
     font-weight: 600;
@@ -762,7 +705,7 @@ function createMemoryModal(
         e.stopPropagation();
         sendExtensionEvent('memory_injection', {
           provider: 'chatgpt',
-          source: 'OPENMEMORY_CHROME_EXTENSION',
+          source: 'REMEMBERME_CHROME_EXTENSION',
           browser: getBrowser(),
           injected_all: false,
           memory_id: memory.id,
@@ -1085,7 +1028,7 @@ function createMemoryModal(
 
     sendExtensionEvent('memory_injection', {
       provider: 'chatgpt',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
       injected_all: true,
       memory_count: newMemories.length,
@@ -1127,13 +1070,13 @@ function updateInputWithMemories(): void {
 
     // Create the memory wrapper with all collected memories
     let memoriesContent =
-      '<div id="mem0-wrapper" contenteditable="false" style="background-color: rgb(220, 252, 231); padding: 8px; border-radius: 4px; margin-top: 8px; margin-bottom: 8px;">';
-    memoriesContent += OPENMEMORY_PROMPTS.memory_header_html_strong;
+      '<div id="rememberme-wrapper" contenteditable="false" style="background-color: rgb(220, 252, 231); padding: 8px; border-radius: 4px; margin-top: 8px; margin-bottom: 8px;">';
+    memoriesContent += REMEMBERME_PROMPTS.memory_header_html_strong;
 
     // Add all memories to the content
     allMemories.forEach((mem, idx) => {
       const safe = (mem || '').toString();
-      memoriesContent += `<div data-mem0-idx="${idx}" style="user-select: text;">- ${safe}</div>`;
+      memoriesContent += `<div data-rememberme-idx="${idx}" style="user-select: text;">- ${safe}</div>`;
     });
     memoriesContent += '</div>';
 
@@ -1146,7 +1089,7 @@ function updateInputWithMemories(): void {
 
     // Make only the wrapper non-editable; allow user to select/copy text inside
     try {
-      const wrapper = document.getElementById('mem0-wrapper');
+      const wrapper = document.getElementById('rememberme-wrapper');
       if (wrapper) {
         wrapper.setAttribute('contenteditable', 'false');
         wrapper.style.userSelect = 'text';
@@ -1189,14 +1132,14 @@ function getContentWithoutMemories(message?: string): string {
   }
 
   // Remove any memory wrappers
-  content = content.replace(/<div id="mem0-wrapper"[\s\S]*?<\/div>/g, '');
+  content = content.replace(/<div id="rememberme-wrapper"[\s\S]*?<\/div>/g, '');
 
   // Remove any memory headers using shared prompts (HTML and plain variants)
   try {
-    const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-    const MEM0_HTML = OPENMEMORY_PROMPTS.memory_header_html_regex;
-    content = content.replace(MEM0_HTML, '');
-    content = content.replace(MEM0_PLAIN, '');
+    const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+    const REMEMBERME_HTML = REMEMBERME_PROMPTS.memory_header_html_regex;
+    content = content.replace(REMEMBERME_HTML, '');
+    content = content.replace(REMEMBERME_PLAIN, '');
   } catch {
     // Ignore errors during re-initialization
   }
@@ -1214,8 +1157,8 @@ function getContentWithoutMemories(message?: string): string {
 function addSendButtonListener(): void {
   const sendButton = document.querySelector('#composer-submit-button') as HTMLButtonElement;
 
-  if (sendButton && !sendButton.dataset.mem0Listener) {
-    sendButton.dataset.mem0Listener = 'true';
+  if (sendButton && !sendButton.dataset.remembermeListener) {
+    sendButton.dataset.remembermeListener = 'true';
     sendButton.addEventListener('click', function () {
       // Capture and save memory asynchronously
       captureAndStoreMemory();
@@ -1233,8 +1176,8 @@ function addSendButtonListener(): void {
       (document.querySelector('div[contenteditable="true"]') as HTMLDivElement) ||
       (document.querySelector('textarea') as HTMLTextAreaElement);
 
-    if (inputElement && !inputElement.dataset.mem0KeyListener) {
-      inputElement.dataset.mem0KeyListener = 'true';
+    if (inputElement && !inputElement.dataset.remembermeKeyListener) {
+      inputElement.dataset.remembermeKeyListener = 'true';
       (inputElement as HTMLElement).addEventListener('keydown', function (event: KeyboardEvent) {
         // Check if Enter was pressed without Shift (standard send behavior)
 
@@ -1272,88 +1215,12 @@ function captureAndStoreMemory(): void {
     return;
   }
 
-  // Get raw content from the input element
   let message = inputElement.textContent || (inputElement as HTMLTextAreaElement)?.value;
-
   if (!message || message.trim() === '') {
     message = inputValueCopy;
   }
 
-  if (!message || message.trim() === '') {
-    return;
-  }
-
-  // Clean the message of any memory wrapper content
-  message = getContentWithoutMemories(message);
-
-  // Skip if message is empty after cleaning
-  if (!message || message.trim() === '') {
-    return;
-  }
-
-  // Asynchronously store the memory
-  chrome.storage.sync.get(
-    [
-      StorageKey.API_KEY,
-      StorageKey.USER_ID_CAMEL,
-      StorageKey.ACCESS_TOKEN,
-      StorageKey.MEMORY_ENABLED,
-      StorageKey.SELECTED_ORG,
-      StorageKey.SELECTED_PROJECT,
-      StorageKey.USER_ID,
-    ],
-    function (items) {
-      // Skip if memory is disabled or no credentials
-      if (
-        items[StorageKey.MEMORY_ENABLED] === false ||
-        (!items[StorageKey.API_KEY] && !items[StorageKey.ACCESS_TOKEN])
-      ) {
-        return;
-      }
-
-      const authHeader = items[StorageKey.ACCESS_TOKEN]
-        ? `Bearer ${items[StorageKey.ACCESS_TOKEN]}`
-        : `Token ${items[StorageKey.API_KEY]}`;
-
-      const userId =
-        items[StorageKey.USER_ID_CAMEL] || items[StorageKey.USER_ID] || DEFAULT_USER_ID;
-
-      // Get recent messages for context (if available)
-      const messages = getLastMessages(2);
-      messages.push({ role: MessageRole.User, content: message });
-
-      const optionalParams: OptionalApiParams = {};
-      if (items[StorageKey.SELECTED_ORG]) {
-        optionalParams.org_id = items[StorageKey.SELECTED_ORG];
-      }
-      if (items[StorageKey.SELECTED_PROJECT]) {
-        optionalParams.project_id = items[StorageKey.SELECTED_PROJECT];
-      }
-
-      // Send memory to mem0 API asynchronously without waiting for response
-      const storagePayload = {
-        messages: messages,
-        user_id: userId,
-        infer: true,
-        metadata: {
-          provider: 'ChatGPT',
-        },
-        source: 'OPENMEMORY_CHROME_EXTENSION',
-        ...optionalParams,
-      };
-
-      fetch('https://api.mem0.ai/v1/memories/', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: authHeader,
-        },
-        body: JSON.stringify(storagePayload),
-      }).catch(error => {
-        console.error('Error saving memory:', error);
-      });
-    }
-  );
+  addMemoryToMem0(message, chatgptConfig, getLastMessages(2));
 }
 
 async function updateNotificationDot(): Promise<void> {
@@ -1366,7 +1233,7 @@ async function updateNotificationDot(): Promise<void> {
     document.querySelector('#prompt-textarea') ||
     document.querySelector('div[contenteditable="true"]') ||
     document.querySelector('textarea');
-  const host = document.getElementById('mem0-icon-button'); // shadow host
+  const host = document.getElementById('rememberme-icon-button'); // shadow host
   if (!input || !host) {
     setTimeout(updateNotificationDot, 1000);
     return;
@@ -1386,42 +1253,33 @@ async function updateNotificationDot(): Promise<void> {
 }
 
 // Modified function to handle Mem0 modal instead of direct injection
-async function handleMem0Modal(sourceButtonId: string | null = null): Promise<void> {
+async function handleRememberMeModal(sourceButtonId: string | null = null): Promise<void> {
   const memoryEnabled = await getMemoryEnabledState();
   if (!memoryEnabled) {
     return;
   }
 
-  // Check if user is logged in
-  const loginData = await new Promise<LoginData>(resolve => {
-    chrome.storage.sync.get(
-      [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
-      function (items) {
-        resolve(items);
-      }
-    );
-  });
-
-  // If no API key and no access token, show login popup
-  if (!loginData[StorageKey.API_KEY] && !loginData[StorageKey.ACCESS_TOKEN]) {
+  // Check if user is logged in (Supabase or legacy)
+  const hasAuth = await hasValidAuth();
+  if (!hasAuth) {
     showLoginPopup();
     return;
   }
 
-  const mem0Button = document.querySelector('#mem0-icon-button') as HTMLElement;
+  const remembermeButton = document.querySelector('#rememberme-icon-button') as HTMLElement;
 
   let message = getInputValue();
   // If no message, show a popup and return
   if (!message || message.trim() === '') {
-    if (mem0Button) {
-      showButtonPopup(mem0Button as HTMLElement, 'Please enter some text first');
+    if (remembermeButton) {
+      showButtonPopup(remembermeButton as HTMLElement, 'Please enter some text first');
     }
     return;
   }
 
   try {
-    const MEM0_PLAIN = OPENMEMORY_PROMPTS.memory_header_plain_regex;
-    message = message.replace(MEM0_PLAIN, '').trim();
+    const REMEMBERME_PLAIN = REMEMBERME_PROMPTS.memory_header_plain_regex;
+    message = message.replace(REMEMBERME_PLAIN, '').trim();
   } catch {
     // Ignore errors during re-initialization
   }
@@ -1430,11 +1288,11 @@ async function handleMem0Modal(sourceButtonId: string | null = null): Promise<vo
     message = message.slice(0, endIndex + 4);
   }
 
-  if (isProcessingMem0) {
+  if (isProcessingRememberMe) {
     return;
   }
 
-  isProcessingMem0 = true;
+  isProcessingRememberMe = true;
 
   // Show the loading modal immediately with the source button ID
   createMemoryModal([], true, sourceButtonId);
@@ -1443,12 +1301,8 @@ async function handleMem0Modal(sourceButtonId: string | null = null): Promise<vo
     const data = await new Promise<StorageData>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.SIMILARITY_THRESHOLD,
           StorageKey.TOP_K,
         ],
@@ -1458,17 +1312,17 @@ async function handleMem0Modal(sourceButtonId: string | null = null): Promise<vo
       );
     });
 
-    const apiKey = data[StorageKey.API_KEY];
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
+    const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+    const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
 
-    if (!apiKey && !accessToken) {
-      isProcessingMem0 = false;
+    if (!supabaseAccessToken || !supabaseUserId) {
+      isProcessingRememberMe = false;
       return;
     }
 
     sendExtensionEvent('modal_clicked', {
       provider: 'chatgpt',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
     });
 
@@ -1476,11 +1330,13 @@ async function handleMem0Modal(sourceButtonId: string | null = null): Promise<vo
     messages.push({ role: MessageRole.User, content: message });
 
     const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+    const orgId = getOrgId();
+    const projectId = getProjectId();
+    if (orgId) {
+      optionalParams.org_id = orgId;
     }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+    if (projectId) {
+      optionalParams.project_id = projectId;
     }
 
     currentModalSourceButtonId = sourceButtonId;
@@ -1491,19 +1347,19 @@ async function handleMem0Modal(sourceButtonId: string | null = null): Promise<vo
     createMemoryModal([], false, sourceButtonId);
     throw error;
   } finally {
-    isProcessingMem0 = false;
+    isProcessingRememberMe = false;
   }
 }
 
 // Function to show a small popup message near the button
 function showButtonPopup(button: HTMLElement, message: string): void {
-  let host = button || document.getElementById('mem0-icon-button');
+  let host = button || document.getElementById('rememberme-icon-button');
   if (!host) {
     return;
   }
   let root = host.shadowRoot || host;
   // Remove any existing popups
-  const existingPopup = root.querySelector('.mem0-button-popup');
+  const existingPopup = root.querySelector('.rememberme-button-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
@@ -1516,7 +1372,7 @@ function showButtonPopup(button: HTMLElement, message: string): void {
   }
 
   const popup = document.createElement('div');
-  popup.className = 'mem0-button-popup';
+  popup.className = 'rememberme-button-popup';
 
   popup.style.cssText = `
     position: absolute;
@@ -1581,16 +1437,18 @@ function setupAutoInjectPrefetch() {
   }
 }
 
+// REMOVED: Button injection code - using notification-only approach
 (function () {
-  if (!OPENMEMORY_UI || !OPENMEMORY_UI.mountOnEditorFocus) {
-    return;
-  }
+  return; // Disabled - notification-only mode
+  // if (!REMEMBERME_UI || !REMEMBERME_UI.mountOnEditorFocus) {
+  //   return;
+  // }
 
   // 1) Try to mount immediately from cached anchor on page load (before focus)
   try {
     // Skip if already mounted (e.g., hot reload / rapid SPA replace)
-    if (!document.getElementById('mem0-icon-button')) {
-      OPENMEMORY_UI.resolveCachedAnchor(
+    if (!document.getElementById('rememberme-icon-button')) {
+      REMEMBERME_UI.resolveCachedAnchor(
         { learnKey: location.host + ':' + location.pathname },
         null,
         24 * 60 * 60 * 1000
@@ -1600,11 +1458,11 @@ function setupAutoInjectPrefetch() {
             return;
           }
           // Reuse the same render and placement as the focus-driven path
-          let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
+          let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
           let host = hs.host,
             shadow = hs.shadow;
-          host.id = 'mem0-icon-button';
-          let unplace = OPENMEMORY_UI.applyPlacement({
+          host.id = 'rememberme-icon-button';
+          let unplace = REMEMBERME_UI.applyPlacement({
             container: host,
             anchor: hit.el,
             placement: hit.placement || {
@@ -1617,17 +1475,17 @@ function setupAutoInjectPrefetch() {
           let style = document.createElement('style');
           style.textContent = `
           :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
+          .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
             justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
+          .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px;
             background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
           :host([data-has-text="1"]) .dot { display:block; }
         `;
           let btn = document.createElement('button');
-          btn.className = 'mem0-btn';
+          btn.className = 'rememberme-btn';
           let img = document.createElement('img');
-          img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
+          img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
           let dot = document.createElement('div');
           dot.className = 'dot';
           btn.appendChild(img);
@@ -1654,7 +1512,7 @@ function setupAutoInjectPrefetch() {
           }
 
           btn.addEventListener('click', function () {
-            handleMem0Modal('mem0-icon-button');
+            handleRememberMeModal('rememberme-icon-button');
           });
           if (typeof updateNotificationDot === 'function') {
             setTimeout(updateNotificationDot, 0);
@@ -1684,194 +1542,195 @@ function setupAutoInjectPrefetch() {
   } catch {
     // Ignore errors during re-initialization
   }
-
+  return; // Disabled - notification-only mode
+  // REMOVED: Button injection - using notification-only approach
   // 2) Standard focus-driven mount
-  OPENMEMORY_UI.mountOnEditorFocus({
-    existingHostSelector: '#mem0-icon-button',
-    editorSelector:
-      typeof SITE_CONFIG !== 'undefined' &&
-      SITE_CONFIG.chatgpt &&
-      SITE_CONFIG.chatgpt.editorSelector
-        ? SITE_CONFIG.chatgpt.editorSelector
-        : 'textarea, [contenteditable="true"], input[type="text"]',
-    deriveAnchor:
-      typeof SITE_CONFIG !== 'undefined' &&
-      SITE_CONFIG.chatgpt &&
-      typeof SITE_CONFIG.chatgpt.deriveAnchor === 'function'
-        ? SITE_CONFIG.chatgpt.deriveAnchor
-        : function (editor) {
-            return editor.closest('form') || editor.parentElement;
-          },
-    placement:
-      typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt && SITE_CONFIG.chatgpt.placement
-        ? SITE_CONFIG.chatgpt.placement
-        : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-    render: function (shadow: ShadowRoot, host: HTMLElement, anchor: Element | null) {
-      host.id = 'mem0-icon-button'; // existing code relies on this
-      let style = document.createElement('style');
-      style.textContent = `
-        :host { position: relative; }
-        .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
-          justify-content:center; width:32px; height:32px; border-radius:50%; }
-        .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-        .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px;
-          background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-        :host([data-has-text="1"]) .dot { display:block; }
-      `;
-      let btn = document.createElement('button');
-      btn.className = 'mem0-btn';
-      let img = document.createElement('img');
-      img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-      let dot = document.createElement('div');
-      dot.className = 'dot';
-      btn.appendChild(img);
-      shadow.append(style, btn, dot);
-
-      try {
-        let cfg =
-          typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt ? SITE_CONFIG.chatgpt : null;
-        let mic = null;
-        if (cfg && Array.isArray(cfg.adjacentTargets)) {
-          for (let i = 0; i < cfg.adjacentTargets.length; i++) {
-            let sel = cfg.adjacentTargets[i];
-            if (sel) {
-              mic = anchor && anchor.querySelector(sel);
-              if (mic) {
-                break;
-              }
-            }
-          }
-        }
-        if (mic && anchor) {
-          let child: Element | null = mic;
-          while (child && child.parentElement !== anchor) {
-            child = child.parentElement;
-          }
-          if (child && child.parentElement === anchor) {
-            anchor.insertBefore(host, child);
-          }
-          host.style.marginRight = ''; // rely on container gap
-          host.style.marginLeft = '';
-        } else {
-          host.style.marginLeft = '4px'; // mild fallback spacing
-        }
-      } catch (_e) {
-        // Ignore errors during re-initialization
-      }
-
-      btn.addEventListener('click', function () {
-        handleMem0Modal('mem0-icon-button');
-      });
-
-      if (typeof updateNotificationDot === 'function') {
-        setTimeout(updateNotificationDot, 0);
-      }
-    },
-    // Optional safety net if deriveAnchor fails
-    fallback: function () {
-      let cfg =
-        typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt ? SITE_CONFIG.chatgpt : null;
-      OPENMEMORY_UI.mountResilient({
-        anchors: [
-          {
-            find: function () {
-              let sel =
-                (cfg && cfg.editorSelector) ||
-                'textarea, [contenteditable="true"], input[type="text"]';
-              let ed = document.querySelector(sel);
-              if (!ed) {
-                return null;
-              }
-              try {
-                return cfg && typeof cfg.deriveAnchor === 'function'
-                  ? cfg.deriveAnchor(ed)
-                  : ed.closest('form') || ed.parentElement;
-              } catch (_) {
-                return ed.closest('form') || ed.parentElement;
-              }
-            },
-          },
-        ],
-        placement: (cfg && cfg.placement) || {
-          strategy: 'inline',
-          where: 'beforeend',
-          inlineAlign: 'end',
-        },
-        enableFloatingFallback: true,
-        render: function (shadow: ShadowRoot, host: HTMLElement, anchor: Element | null) {
-          host.id = 'mem0-icon-button'; // host is the shadow root container
-          let style = document.createElement('style');
-          style.textContent = `
-            :host { position: relative; }
-            .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
-              justify-content:center; width:32px; height:32px; border-radius:50%; }
-            .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-            .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px;
-              background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-            :host([data-has-text="1"]) .dot { display:block; }
-          `;
-          let btn = document.createElement('button');
-          btn.className = 'mem0-btn';
-          let img = document.createElement('img');
-          img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-          let dot = document.createElement('div');
-          dot.className = 'dot';
-          btn.appendChild(img);
-          shadow.append(style, btn, dot);
-          btn.addEventListener('click', function () {
-            handleMem0Modal('mem0-icon-button');
-          });
-
-          // Move host to the left of the mic inside the same toolbar container
-          try {
-            let cfg =
-              typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt
-                ? SITE_CONFIG.chatgpt
-                : null;
-            let mic = null;
-            if (cfg && Array.isArray(cfg.adjacentTargets)) {
-              for (let i = 0; i < cfg.adjacentTargets.length; i++) {
-                let sel = cfg.adjacentTargets[i];
-                if (sel) {
-                  mic = anchor && anchor.querySelector(sel);
-                  if (mic) {
-                    break;
-                  }
-                }
-              }
-            } else {
-              mic =
-                anchor &&
-                (anchor.querySelector('button[aria-label="Dictate button"]') ||
-                  anchor.querySelector('button[aria-label*="mic" i]') ||
-                  anchor.querySelector('button[aria-label*="voice" i]'));
-            }
-            if (mic && anchor) {
-              let child: Element | null = mic;
-              while (child && child.parentElement !== anchor) {
-                child = child.parentElement;
-              }
-              if (child && child.parentElement === anchor) {
-                anchor.insertBefore(host, child);
-              }
-              host.style.marginRight = ''; // rely on container gap
-              host.style.marginLeft = '';
-            } else {
-              host.style.marginLeft = '4px'; // mild fallback spacing
-            }
-          } catch (_e) {
-            // Ignore errors during re-initialization
-          }
-
-          if (typeof updateNotificationDot === 'function') {
-            setTimeout(updateNotificationDot, 0);
-          }
-        },
-      });
-    },
-    persistCache: true,
-    cacheTtlMs: 24 * 60 * 60 * 1000,
-  });
+  // REMEMBERME_UI.mountOnEditorFocus({
+  //   existingHostSelector: '#rememberme-icon-button',
+  //   editorSelector:
+//       typeof SITE_CONFIG !== 'undefined' &&
+//       SITE_CONFIG.chatgpt &&
+//       SITE_CONFIG.chatgpt.editorSelector
+//         ? SITE_CONFIG.chatgpt.editorSelector
+//         : 'textarea, [contenteditable="true"], input[type="text"]',
+//     deriveAnchor:
+//       typeof SITE_CONFIG !== 'undefined' &&
+//       SITE_CONFIG.chatgpt &&
+//       typeof SITE_CONFIG.chatgpt.deriveAnchor === 'function'
+//         ? SITE_CONFIG.chatgpt.deriveAnchor
+//         : function (editor) {
+//             return editor.closest('form') || editor.parentElement;
+//           },
+//     placement:
+//       typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt && SITE_CONFIG.chatgpt.placement
+//         ? SITE_CONFIG.chatgpt.placement
+//         : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
+//     render: function (shadow: ShadowRoot, host: HTMLElement, anchor: Element | null) {
+//       host.id = 'rememberme-icon-button'; // existing code relies on this
+//       let style = document.createElement('style');
+//       style.textContent = `
+//         :host { position: relative; }
+//         .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
+//           justify-content:center; width:32px; height:32px; border-radius:50%; }
+//         .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//         .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px;
+//           background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//         :host([data-has-text="1"]) .dot { display:block; }
+//       `;
+//       let btn = document.createElement('button');
+//       btn.className = 'rememberme-btn';
+//       let img = document.createElement('img');
+//       img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//       let dot = document.createElement('div');
+//       dot.className = 'dot';
+//       btn.appendChild(img);
+//       shadow.append(style, btn, dot);
+// 
+//       try {
+//         let cfg =
+//           typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt ? SITE_CONFIG.chatgpt : null;
+//         let mic = null;
+//         if (cfg && Array.isArray(cfg.adjacentTargets)) {
+//           for (let i = 0; i < cfg.adjacentTargets.length; i++) {
+//             let sel = cfg.adjacentTargets[i];
+//             if (sel) {
+//               mic = anchor && anchor.querySelector(sel);
+//               if (mic) {
+//                 break;
+//               }
+//             }
+//           }
+//         }
+//         if (mic && anchor) {
+//           let child: Element | null = mic;
+//           while (child && child.parentElement !== anchor) {
+//             child = child.parentElement;
+//           }
+//           if (child && child.parentElement === anchor) {
+//             anchor.insertBefore(host, child);
+//           }
+//           host.style.marginRight = ''; // rely on container gap
+//           host.style.marginLeft = '';
+//         } else {
+//           host.style.marginLeft = '4px'; // mild fallback spacing
+//         }
+//       } catch (_e) {
+//         // Ignore errors during re-initialization
+//       }
+// 
+//       btn.addEventListener('click', function () {
+//         handleRememberMeModal('rememberme-icon-button');
+//       });
+// 
+//       if (typeof updateNotificationDot === 'function') {
+//         setTimeout(updateNotificationDot, 0);
+//       }
+//     },
+//     // Optional safety net if deriveAnchor fails
+//     fallback: function () {
+//       let cfg =
+//         typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt ? SITE_CONFIG.chatgpt : null;
+//       REMEMBERME_UI.mountResilient({
+//         anchors: [
+//           {
+//             find: function () {
+//               let sel =
+//                 (cfg && cfg.editorSelector) ||
+//                 'textarea, [contenteditable="true"], input[type="text"]';
+//               let ed = document.querySelector(sel);
+//               if (!ed) {
+//                 return null;
+//               }
+//               try {
+//                 return cfg && typeof cfg.deriveAnchor === 'function'
+//                   ? cfg.deriveAnchor(ed)
+//                   : ed.closest('form') || ed.parentElement;
+//               } catch (_) {
+//                 return ed.closest('form') || ed.parentElement;
+//               }
+//             },
+//           },
+//         ],
+//         placement: (cfg && cfg.placement) || {
+//           strategy: 'inline',
+//           where: 'beforeend',
+//           inlineAlign: 'end',
+//         },
+//         enableFloatingFallback: true,
+//         render: function (shadow: ShadowRoot, host: HTMLElement, anchor: Element | null) {
+//           host.id = 'rememberme-icon-button'; // host is the shadow root container
+//           let style = document.createElement('style');
+//           style.textContent = `
+//             :host { position: relative; }
+//             .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center;
+//               justify-content:center; width:32px; height:32px; border-radius:50%; }
+//             .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//             .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px;
+//               background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//             :host([data-has-text="1"]) .dot { display:block; }
+//           `;
+//           let btn = document.createElement('button');
+//           btn.className = 'rememberme-btn';
+//           let img = document.createElement('img');
+//           img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//           let dot = document.createElement('div');
+//           dot.className = 'dot';
+//           btn.appendChild(img);
+//           shadow.append(style, btn, dot);
+//           btn.addEventListener('click', function () {
+//             handleRememberMeModal('rememberme-icon-button');
+//           });
+// 
+//           // Move host to the left of the mic inside the same toolbar container
+//           try {
+//             let cfg =
+//               typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.chatgpt
+//                 ? SITE_CONFIG.chatgpt
+//                 : null;
+//             let mic = null;
+//             if (cfg && Array.isArray(cfg.adjacentTargets)) {
+//               for (let i = 0; i < cfg.adjacentTargets.length; i++) {
+//                 let sel = cfg.adjacentTargets[i];
+//                 if (sel) {
+//                   mic = anchor && anchor.querySelector(sel);
+//                   if (mic) {
+//                     break;
+//                   }
+//                 }
+//               }
+//             } else {
+//               mic =
+//                 anchor &&
+//                 (anchor.querySelector('button[aria-label="Dictate button"]') ||
+//                   anchor.querySelector('button[aria-label*="mic" i]') ||
+//                   anchor.querySelector('button[aria-label*="voice" i]'));
+//             }
+//             if (mic && anchor) {
+//               let child: Element | null = mic;
+//               while (child && child.parentElement !== anchor) {
+//                 child = child.parentElement;
+//               }
+//               if (child && child.parentElement === anchor) {
+//                 anchor.insertBefore(host, child);
+//               }
+//               host.style.marginRight = ''; // rely on container gap
+//               host.style.marginLeft = '';
+//             } else {
+//               host.style.marginLeft = '4px'; // mild fallback spacing
+//             }
+//           } catch (_e) {
+//             // Ignore errors during re-initialization
+//           }
+// 
+//           if (typeof updateNotificationDot === 'function') {
+//             setTimeout(updateNotificationDot, 0);
+//           }
+//         },
+//       });
+//     },
+//     persistCache: true,
+//     cacheTtlMs: 24 * 60 * 60 * 1000,
+//   });
 })();
 
 function getLastMessages(count: number): Array<{ role: MessageRole; content: string }> {
@@ -1914,39 +1773,7 @@ function getInputValue(): string {
     : '';
 }
 
-let chatgptBackgroundSearchHandler: ((this: Element, ev: Event) => void) | null = null;
-
-function hookBackgroundSearchTyping() {
-  const inputElement =
-    document.querySelector('#prompt-textarea') ||
-    document.querySelector('div[contenteditable="true"]') ||
-    document.querySelector('textarea');
-  if (!inputElement) {
-    return;
-  }
-
-  if (inputElement.dataset.mem0BackgroundHooked) {
-    return; 
-  }
-
-  inputElement.dataset.mem0BackgroundHooked = 'true'; 
-
-  if (!chatgptBackgroundSearchHandler) {
-    chatgptBackgroundSearchHandler = function () {
-      const text = getInputValue() || '';
-      console.log("Background search for:", text); 
-      chatgptSearch.setText(text);
-    };
-  }
-  inputElement.addEventListener(
-    'input',
-    chatgptBackgroundSearchHandler as (this: Element, ev: Event) => void
-  );
-  inputElement.addEventListener(
-    'keyup',
-    chatgptBackgroundSearchHandler as (this: Element, ev: Event) => void
-  );
-}
+const hookBackgroundSearchTyping = setupBackgroundSearchHook(chatgptConfig, chatgptSearch);
 
 function addSyncButton(): void {
   const buttonContainer = document.querySelector('div.mt-5.flex.justify-end');
@@ -1969,7 +1796,7 @@ function addSyncButton(): void {
       syncButton.style.marginRight = '8px';
 
       const syncIcon = document.createElement('img');
-      syncIcon.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+      syncIcon.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
       syncIcon.style.width = '16px';
       syncIcon.style.height = '16px';
       syncIcon.style.marginRight = '8px';
@@ -2061,7 +1888,7 @@ function handleSyncClick(): void {
                 showSyncPopup(syncButton, `${syncedCount} memories synced`);
                 setSyncButtonLoadingState(false);
                 // Open the modal with memories after syncing
-                // handleMem0Modal('sync-button');
+                // handleRememberMeModal('sync-button');
               }
             })
             .catch(() => {
@@ -2069,7 +1896,7 @@ function handleSyncClick(): void {
                 showSyncPopup(syncButton, `${syncedCount}/${totalCount} memories synced`);
                 setSyncButtonLoadingState(false);
                 // Open the modal with memories after syncing
-                // handleMem0Modal('sync-button');
+                // handleRememberMeModal('sync-button');
               }
             });
         }
@@ -2082,7 +1909,7 @@ function handleSyncClick(): void {
           }
           setSyncButtonLoadingState(false);
           // Open the modal with memories after syncing
-          handleMem0Modal('sync-button');
+          handleRememberMeModal('sync-button');
         })
         .catch(error => {
           console.error('Error syncing memories:', error);
@@ -2091,7 +1918,7 @@ function handleSyncClick(): void {
           }
           setSyncButtonLoadingState(false);
           // Open the modal even if there was an error
-          handleMem0Modal('sync-button');
+          handleRememberMeModal('sync-button');
         });
     } else {
       console.error('Table or Sync button not found');
@@ -2104,43 +1931,49 @@ function sendMemoriesToMem0(memories: Array<{ role: string; content: string }>):
   return new Promise<void>((resolve, reject) => {
     chrome.storage.sync.get(
       [
-        StorageKey.API_KEY,
-        StorageKey.USER_ID_CAMEL,
-        StorageKey.ACCESS_TOKEN,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
-        StorageKey.USER_ID,
+        StorageKey.SUPABASE_ACCESS_TOKEN,
+        StorageKey.SUPABASE_USER_ID,
       ],
       function (items) {
-        if (items[StorageKey.API_KEY] || items[StorageKey.ACCESS_TOKEN]) {
-          const authHeader = items[StorageKey.ACCESS_TOKEN]
-            ? `Bearer ${items[StorageKey.ACCESS_TOKEN]}`
-            : `Token ${items[StorageKey.API_KEY]}`;
-          const userId =
-            items[StorageKey.USER_ID_CAMEL] || items[StorageKey.USER_ID] || DEFAULT_USER_ID;
+        const supabaseAccessToken = items[StorageKey.SUPABASE_ACCESS_TOKEN];
+        const supabaseUserId = items[StorageKey.SUPABASE_USER_ID];
+        
+        if (!supabaseAccessToken || !supabaseUserId) {
+          reject('Supabase authentication required');
+          return;
+        }
 
           const optionalParams: OptionalApiParams = {};
-          if (items[StorageKey.SELECTED_ORG]) {
-            optionalParams.org_id = items[StorageKey.SELECTED_ORG];
+        const orgId = getOrgId();
+        const projectId = getProjectId();
+        if (orgId) {
+          optionalParams.org_id = orgId;
           }
-          if (items[StorageKey.SELECTED_PROJECT]) {
-            optionalParams.project_id = items[StorageKey.SELECTED_PROJECT];
+        if (projectId) {
+          optionalParams.project_id = projectId;
           }
+
+          const apiKey = getApiKey();
+          if (!apiKey) {
+            console.error('[ChatGPT] VITE_MEM0_API_KEY not configured');
+            return;
+          }
+          const authHeader = `Token ${apiKey}`;
 
           fetch('https://api.mem0.ai/v1/memories/', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: authHeader,
+            Authorization: authHeader,
             },
             body: JSON.stringify({
               messages: memories,
-              user_id: userId,
+            user_id: supabaseUserId,
               infer: true,
               metadata: {
                 provider: 'ChatGPT',
               },
-              source: 'OPENMEMORY_CHROME_EXTENSION',
+            version: 'v2',
               ...optionalParams,
             }),
           })
@@ -2152,9 +1985,6 @@ function sendMemoriesToMem0(memories: Array<{ role: string; content: string }>):
               }
             })
             .catch(error => reject(`Error sending memories to Mem0: ${error}`));
-        } else {
-          reject('API Key/Access Token not set');
-        }
       }
     );
   });
@@ -2224,43 +2054,49 @@ function sendMemoryToMem0(
   return new Promise<void>((resolve, reject) => {
     chrome.storage.sync.get(
       [
-        StorageKey.API_KEY,
-        StorageKey.USER_ID_CAMEL,
-        StorageKey.ACCESS_TOKEN,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
-        StorageKey.USER_ID,
+        StorageKey.SUPABASE_ACCESS_TOKEN,
+        StorageKey.SUPABASE_USER_ID,
       ],
       function (items) {
-        if (items[StorageKey.API_KEY] || items[StorageKey.ACCESS_TOKEN]) {
-          const authHeader = items[StorageKey.ACCESS_TOKEN]
-            ? `Bearer ${items[StorageKey.ACCESS_TOKEN]}`
-            : `Token ${items[StorageKey.API_KEY]}`;
-          const userId =
-            items[StorageKey.USER_ID_CAMEL] || items[StorageKey.USER_ID] || DEFAULT_USER_ID;
+        const supabaseAccessToken = items[StorageKey.SUPABASE_ACCESS_TOKEN];
+        const supabaseUserId = items[StorageKey.SUPABASE_USER_ID];
+        
+        if (!supabaseAccessToken || !supabaseUserId) {
+          reject('Supabase authentication required');
+          return;
+        }
 
           const optionalParams: OptionalApiParams = {};
-          if (items[StorageKey.SELECTED_ORG]) {
-            optionalParams.org_id = items[StorageKey.SELECTED_ORG];
+        const orgId = getOrgId();
+        const projectId = getProjectId();
+        if (orgId) {
+          optionalParams.org_id = orgId;
           }
-          if (items[StorageKey.SELECTED_PROJECT]) {
-            optionalParams.project_id = items[StorageKey.SELECTED_PROJECT];
+        if (projectId) {
+          optionalParams.project_id = projectId;
           }
+
+          const apiKey = getApiKey();
+          if (!apiKey) {
+            console.error('[ChatGPT] VITE_MEM0_API_KEY not configured');
+            return;
+          }
+          const authHeader = `Token ${apiKey}`;
 
           fetch('https://api.mem0.ai/v1/memories/', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: authHeader,
+            Authorization: authHeader,
             },
             body: JSON.stringify({
               messages: [{ content: memory.content, role: MessageRole.User }],
-              user_id: userId,
+            user_id: supabaseUserId,
               infer: infer,
               metadata: {
                 provider: 'ChatGPT',
               },
-              source: 'OPENMEMORY_CHROME_EXTENSION',
+            version: 'v2',
               ...optionalParams,
             }),
           })
@@ -2272,9 +2108,6 @@ function sendMemoryToMem0(
               }
             })
             .catch(error => reject(`Error sending memory to Mem0: ${error}`));
-        } else {
-          reject('API Key/Access Token not set');
-        }
       }
     );
   });
@@ -2296,7 +2129,7 @@ function getMemoryEnabledState(): Promise<boolean> {
 function initializeMem0Integration(): void {
   document.addEventListener('DOMContentLoaded', () => {
     addSyncButton();
-    // (async () => await addMem0IconButton())();
+    // (async () => await addRememberMeIconButton())();
     addSendButtonListener();
     // (async () => await updateNotificationDot())();
     hookBackgroundSearchTyping();
@@ -2307,7 +2140,7 @@ function initializeMem0Integration(): void {
     if (event.ctrlKey && event.key === 'm') {
       event.preventDefault();
       (async () => {
-        await handleMem0Modal('mem0-icon-button');
+        await handleRememberMeModal('rememberme-icon-button');
       })();
     }
   });
@@ -2316,10 +2149,17 @@ function initializeMem0Integration(): void {
 
   observer = new MutationObserver(() => {
     addSyncButton();
-    // (async () => await addMem0IconButton())();
+    // (async () => await addRememberMeIconButton())();
     addSendButtonListener();
     // (async () => await updateNotificationDot())();
+    let inputElement: HTMLElement | null = null;
+    for (const selector of chatgptConfig.inputSelectors) {
+      inputElement = document.querySelector(selector);
+      if (inputElement) break;
+    }
+    if (inputElement && !(inputElement as any).dataset[chatgptConfig.backgroundSearchHookAttribute]) {
     hookBackgroundSearchTyping();
+    }
     setupAutoInjectPrefetch();
   });
 
@@ -2327,10 +2167,17 @@ function initializeMem0Integration(): void {
 
   // Add a MutationObserver to watch for changes in the DOM but don't intercept Enter key
   const observerForUI = new MutationObserver(() => {
-    // (async () => await addMem0IconButton())();
+    // (async () => await addRememberMeIconButton())();
     addSendButtonListener();
     // (async () => await updateNotificationDot())();
+    let inputElement: HTMLElement | null = null;
+    for (const selector of chatgptConfig.inputSelectors) {
+      inputElement = document.querySelector(selector);
+      if (inputElement) break;
+    }
+    if (inputElement && !(inputElement as any).dataset[chatgptConfig.backgroundSearchHookAttribute]) {
     hookBackgroundSearchTyping();
+    }
     setupAutoInjectPrefetch();
   });
 
@@ -2345,14 +2192,14 @@ function initializeMem0Integration(): void {
 // Function to show login popup
 function showLoginPopup() {
   // First remove any existing popups
-  const existingPopup = document.querySelector('#mem0-login-popup');
+  const existingPopup = document.querySelector('#rememberme-login-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   // Create popup container
   const popupOverlay = document.createElement('div');
-  popupOverlay.id = 'mem0-login-popup';
+  popupOverlay.id = 'rememberme-login-popup';
   popupOverlay.style.cssText = `
     position: fixed;
     top: 0;
@@ -2404,7 +2251,7 @@ function showLoginPopup() {
   `;
 
   const logo = document.createElement('img');
-  logo.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logo.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logo.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2413,7 +2260,7 @@ function showLoginPopup() {
   `;
 
   const logoDark = document.createElement('img');
-  logoDark.src = chrome.runtime.getURL('icons/mem0-icon-black.png');
+  logoDark.src = chrome.runtime.getURL('icons/rememberme-icon.png');
   logoDark.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2422,7 +2269,7 @@ function showLoginPopup() {
   `;
 
   const heading = document.createElement('h2');
-  heading.textContent = 'Sign in to OpenMemory';
+  heading.textContent = 'Sign in to RememberMe';
   heading.style.cssText = `
     margin: 0;
     font-size: 18px;
@@ -2531,7 +2378,7 @@ function chatgptDetectNavigation() {
     setTimeout(() => {
       try {
         addSyncButton();
-        // (async () => await addMem0IconButton())();
+        // (async () => await addRememberMeIconButton())();
         addSendButtonListener();
         // (async () => await updateNotificationDot())();
       } catch {

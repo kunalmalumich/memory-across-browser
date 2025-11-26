@@ -22,6 +22,7 @@ Thumbs.db
 # Chrome extension specific
 *.crx
 *.pem
+dist.pem
 
 # IDE files
 .vscode/

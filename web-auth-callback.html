@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RememberMe Authentication</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #333;
+    }
+    .container {
+      background: white;
+      padding: 2rem;
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      text-align: center;
+      max-width: 400px;
+      width: 90%;
+    }
+    .success {
+      color: #10b981;
+      font-size: 1.1rem;
+      margin: 1rem 0;
+    }
+    .error {
+      color: #ef4444;
+      font-size: 1.1rem;
+      margin: 1rem 0;
+    }
+    .loading {
+      color: #667eea;
+      font-size: 1.1rem;
+      margin: 1rem 0;
+    }
+    .spinner {
+      border: 3px solid #f3f4f6;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 1rem auto;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div id="status">
+      <div class="spinner"></div>
+      <div class="loading">Processing authentication...</div>
+    </div>
+  </div>
+
+  <script>
+    (async () => {
+      const statusDiv = document.getElementById('status');
+      
+      try {
+        // Supabase can return session in two formats:
+        // 1. Hash fragment: #access_token=...&refresh_token=...&expires_at=...&type=...
+        // 2. Query string: ?token_hash=...&type=...
+        
+        // Check hash fragment first (most common for redirects)
+        const hash = window.location.hash.substring(1); // Remove #
+        const hashParams = new URLSearchParams(hash);
+        const accessToken = hashParams.get('access_token');
+        const refreshToken = hashParams.get('refresh_token');
+        const expiresAt = hashParams.get('expires_at');
+        const tokenType = hashParams.get('type');
+        
+        // Check query string for token_hash (alternative format)
+        const urlParams = new URLSearchParams(window.location.search);
+        const tokenHash = urlParams.get('token_hash');
+        const queryType = urlParams.get('type') || 'email';
+        
+        // Extension ID - this should match your extension's ID
+        // You can find it in chrome://extensions/ or by checking chrome.runtime.id in the extension
+        const extensionId = 'idefadmdkhjfdhjgpkfmmndhdefdcgnelp';
+        
+        // If we have session data in hash fragment, use it directly
+        if (accessToken && refreshToken && expiresAt) {
+          console.log('[Web Auth Callback] Received session in hash fragment');
+          
+          // Extract user info from access token (JWT payload)
+          let userId = null;
+          let userEmail = null;
+          try {
+            // Decode URL-encoded token first
+            const decodedToken = decodeURIComponent(accessToken);
+            const parts = decodedToken.split('.');
+            
+            if (parts.length === 3) {
+              // Fix base64 URL-safe encoding (JWT uses URL-safe base64)
+              let base64Payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+              // Fix base64 padding
+              while (base64Payload.length % 4) {
+                base64Payload += '=';
+              }
+              
+              const payload = JSON.parse(atob(base64Payload));
+            userId = payload.sub;
+            userEmail = payload.email;
+              console.log('[Web Auth Callback] Successfully parsed user from token');
+            }
+          } catch (e) {
+            console.warn('[Web Auth Callback] Could not parse access token:', e);
+            // This is okay - background script will fetch user info via API as fallback
+          }
+          
+          // Send session data to extension via postMessage (content script will intercept)
+          try {
+            // Post message to window - content script will intercept and forward to background
+            window.postMessage({
+              type: 'REMEMBERME_AUTH_CALLBACK',
+              action: 'SUPABASE_MAGIC_LINK_CALLBACK',
+              session: {
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                expires_at: parseInt(expiresAt, 10),
+                token_type: hashParams.get('token_type') || 'bearer'
+              },
+              user: {
+                id: userId,
+                email: userEmail
+              },
+              authType: tokenType || queryType || 'email'
+            }, '*');
+            
+            // Listen for response from content script
+            const responseListener = (event) => {
+              if (event.data && event.data.type === 'REMEMBERME_AUTH_RESPONSE') {
+                window.removeEventListener('message', responseListener);
+                if (event.data.success) {
+                  statusDiv.innerHTML = 
+                    '<div class="success">✓ Authentication successful!<br>You can close this tab.</div>';
+                  setTimeout(() => {
+                    window.close();
+                  }, 2000);
+                } else {
+                  statusDiv.innerHTML = 
+                    `<div class="error">Authentication failed: ${event.data.error || 'Unknown error'}</div>`;
+                }
+              }
+            };
+            window.addEventListener('message', responseListener);
+            
+            // Timeout after 10 seconds
+            setTimeout(() => {
+              window.removeEventListener('message', responseListener);
+              if (statusDiv.innerHTML.includes('Processing')) {
+                statusDiv.innerHTML = 
+                  '<div class="error">Timeout: Could not connect to extension.<br><br>Make sure the RememberMe extension is installed and enabled.</div>';
+              }
+            }, 10000);
+          } catch (error) {
+            console.error('[Web Auth Callback] Error:', error);
+            statusDiv.innerHTML = 
+              `<div class="error">Error: ${error.message}</div>`;
+          }
+          return;
+        }
+        
+        // Fallback: Use token_hash if available
+        if (tokenHash) {
+          console.log('[Web Auth Callback] Received token_hash in query string');
+          
+          try {
+            // Post message to window - content script will intercept and forward to background
+            window.postMessage({
+              type: 'REMEMBERME_AUTH_CALLBACK',
+              action: 'SUPABASE_MAGIC_LINK_CALLBACK',
+              tokenHash: tokenHash,
+              authType: queryType
+            }, '*');
+            
+            // Listen for response from content script
+            const responseListener = (event) => {
+              if (event.data && event.data.type === 'REMEMBERME_AUTH_RESPONSE') {
+                window.removeEventListener('message', responseListener);
+                if (event.data.success) {
+                  statusDiv.innerHTML = 
+                    '<div class="success">✓ Authentication successful!<br>You can close this tab.</div>';
+                  setTimeout(() => {
+                    window.close();
+                  }, 2000);
+                } else {
+                  statusDiv.innerHTML = 
+                    `<div class="error">Authentication failed: ${event.data.error || 'Unknown error'}</div>`;
+                }
+              }
+            };
+            window.addEventListener('message', responseListener);
+            
+            // Timeout after 10 seconds
+            setTimeout(() => {
+              window.removeEventListener('message', responseListener);
+              if (statusDiv.innerHTML.includes('Processing')) {
+                statusDiv.innerHTML = 
+                  '<div class="error">Timeout: Could not connect to extension.<br><br>Make sure the RememberMe extension is installed and enabled.</div>';
+              }
+            }, 10000);
+          } catch (error) {
+            console.error('[Web Auth Callback] Error:', error);
+            statusDiv.innerHTML = 
+              `<div class="error">Error: ${error.message}</div>`;
+          }
+          return;
+        }
+        
+        // No valid token found
+        statusDiv.innerHTML = 
+          '<div class="error">Invalid authentication link. Missing token or session data.</div>';
+        
+      } catch (error) {
+        statusDiv.innerHTML = 
+          `<div class="error">Error: ${error.message}</div>`;
+      }
+    })();
+  </script>
+</body>
+</html>
+

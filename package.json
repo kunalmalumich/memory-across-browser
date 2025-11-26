@@ -1,9 +1,13 @@
 {
-  "name": "mem0-extension",
-  "description": "🧠 OpenMemory keeps your conversations in sync. 🔄 No more repeating yourself—just seamless AI collaboration! ✨",
+  "name": "rememberme-extension",
+  "description": "🧠 RememberMe keeps your conversations in sync. 🔄 No more repeating yourself—just seamless AI collaboration! ✨",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
+    "setup": "nvm use || (echo 'Please install nvm: https://github.com/nvm-sh/nvm' && exit 1)",
     "build": "vite build",
     "lint": "eslint src --ext .ts,.tsx --fix",
     "lint:check": "eslint src --ext .ts,.tsx",
@@ -23,5 +27,8 @@
     "prettier": "^3.3.3",
     "typescript": "^5.9.2",
     "vite": "^7.1.4"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.78.0"
   }
 }

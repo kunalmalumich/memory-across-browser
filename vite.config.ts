@@ -4,5 +4,7 @@ import manifest from './manifest.json';
 
 export default defineConfig({
   plugins: [crx({ manifest })],
-  build: { outDir: 'dist', emptyOutDir: true }
+  build: { outDir: 'dist', emptyOutDir: true },
+  // Load environment variables from .env file
+  envPrefix: 'VITE_',
 });

@@ -2,12 +2,8 @@ import type { MemorySearchItem } from '../types/memory';
 import type { StorageKey } from '../types/storage';
 
 export type SearchStorage = Partial<{
-  [StorageKey.API_KEY]: string;
-  [StorageKey.USER_ID_CAMEL]: string;
-  [StorageKey.ACCESS_TOKEN]: string;
-  [StorageKey.SELECTED_ORG]: string;
-  [StorageKey.SELECTED_PROJECT]: string;
-  [StorageKey.USER_ID]: string;
+  [StorageKey.SUPABASE_ACCESS_TOKEN]: string;
+  [StorageKey.SUPABASE_USER_ID]: string;
   [StorageKey.SIMILARITY_THRESHOLD]: number;
   [StorageKey.TOP_K]: number;
 }>;
@@ -85,6 +81,7 @@ export function createOrchestrator(options: OrchestratorOptions): Orchestrator {
   let latestText = '';
   let lastCompletedQuery = '';
   let lastResult: MemorySearchItem[] | null = null;
+  let lastSearchedQuery = '';
 
   let inFlightQuery: string | null = null;
   let abortController: AbortController | null = null;
@@ -216,6 +213,7 @@ export function createOrchestrator(options: OrchestratorOptions): Orchestrator {
         }
         setCached(norm, result as MemorySearchItem[]);
         lastCompletedQuery = norm;
+        lastSearchedQuery = norm;
         lastResult = result as MemorySearchItem[];
         onSuccess(norm, result as MemorySearchItem[], { fromCache: false });
       })
@@ -240,9 +238,30 @@ export function createOrchestrator(options: OrchestratorOptions): Orchestrator {
 
   function schedule() {
     clearTimer();
-    if (!latestText || normalizeQuery(latestText).length < minLength) {
+    const norm = normalizeQuery(latestText);
+    if (!norm || norm.length < minLength) {
       return;
     }
+
+    // Check exact match - skip if already searched or currently searching
+    if (norm === lastSearchedQuery || norm === inFlightQuery) {
+      return;
+    }
+
+    // Check if query changed meaningfully (at least 2 characters difference)
+    if (lastSearchedQuery && norm) {
+      const diff = Math.abs(norm.length - lastSearchedQuery.length);
+      // Skip if only 1 character changed and queries are very similar
+      if (diff <= 1 && norm.length > 0 && lastSearchedQuery.length > 0) {
+        // Calculate similarity - if queries are almost identical, skip
+        const shorter = norm.length < lastSearchedQuery.length ? norm : lastSearchedQuery;
+        const longer = norm.length >= lastSearchedQuery.length ? norm : lastSearchedQuery;
+        if (longer.startsWith(shorter) || shorter.startsWith(longer.slice(0, shorter.length))) {
+          return; // Not enough change, skip search
+        }
+      }
+    }
+
     timerId = setTimeout(() => {
       timerId = null;
       run(latestText);

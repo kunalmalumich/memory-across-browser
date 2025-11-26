@@ -3,13 +3,29 @@ import { MessageRole } from '../types/api';
 import type { MemoryItem, MemorySearchItem, OptionalApiParams } from '../types/memory';
 import { SidebarAction } from '../types/messages';
 import { type StorageItems, StorageKey } from '../types/storage';
-import { createOrchestrator, type SearchStorage } from '../utils/background_search';
-import { OPENMEMORY_PROMPTS } from '../utils/llm_prompts';
+import { REMEMBERME_PROMPTS } from '../utils/llm_prompts';
 import { SITE_CONFIG } from '../utils/site_config';
-import { getBrowser, sendExtensionEvent } from '../utils/util_functions';
-import { OPENMEMORY_UI, type Placement } from '../utils/util_positioning';
+import {
+  getBrowser,
+  sendExtensionEvent,
+  getOrgId,
+  getProjectId,
+  getApiKey,
+} from '../utils/util_functions';
+import {
+  createPlatformSearchOrchestrator,
+  setupBackgroundSearchHook,
+  addMemoryToMem0,
+  type PlatformConfig,
+} from '../utils/content_script_common';
+import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
 export {};
+
+console.log('[Perplexity] Content script loaded at:', new Date().toISOString());
+console.log('[Perplexity] Document ready state:', document.readyState);
+console.log('[Perplexity] Current URL:', window.location.href);
+console.log('[Perplexity] Top-level code execution continuing...');
 
 // Add global variables for memory modal
 let memoryModalShown: boolean = false;
@@ -21,1056 +37,19 @@ let currentModalOverlay: HTMLDivElement | null = null;
 // Add a variable to track the submit button observer
 let submitButtonObserver: MutationObserver | null = null;
 // Add variable to track if mem0 processing is happening
-let isProcessingMem0: boolean = false;
+let isProcessingRememberMe: boolean = false;
 // Track modal position for dragging
 let modalPosition: { top: number | null; left: number | null } = { top: null, left: null };
 let isDragging: boolean = false;
 
-const perplexitySearch = createOrchestrator({
-  fetch: async function (query: string, opts: { signal?: AbortSignal }) {
-    const data = await new Promise<SearchStorage>(resolve => {
-      chrome.storage.sync.get(
-        [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
-          StorageKey.SIMILARITY_THRESHOLD,
-          StorageKey.TOP_K,
-        ],
-        function (items) {
-          resolve(items as SearchStorage);
-        }
-      );
-    });
-
-    const apiKey = data[StorageKey.API_KEY];
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    if (!apiKey && !accessToken) {
-      return [];
-    }
-
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
-    const userId =
-      data[StorageKey.USER_ID_CAMEL] || data[StorageKey.USER_ID] || 'chrome-extension-user';
-    const threshold =
-      data[StorageKey.SIMILARITY_THRESHOLD] !== undefined
-        ? data[StorageKey.SIMILARITY_THRESHOLD]
-        : 0.1;
-    const topK = data[StorageKey.TOP_K] !== undefined ? data[StorageKey.TOP_K] : 10;
-
-    const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
-    }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
-    }
-
-    const payload = {
-      query,
-      filters: { user_id: userId },
-      rerank: true,
-      threshold: threshold,
-      top_k: topK,
-      filter_memories: false,
-      source: 'OPENMEMORY_CHROME_EXTENSION',
-      ...optionalParams,
-    };
-
-    const res = await fetch('https://api.mem0.ai/v2/memories/search/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: authHeader,
-      },
-      body: JSON.stringify(payload),
-      signal: opts && opts.signal,
-    });
-
-    if (!res.ok) {
-      throw new Error(`API request failed with status ${res.status}`);
-    }
-    return await res.json();
-  },
-
-  // Don’t render on prefetch. When modal is open, update it.
-  onSuccess: function (normQuery: string, responseData: MemorySearchItem[]) {
-    if (!memoryModalShown) {
-      return;
-    }
-    const memoryItems = ((responseData as MemorySearchItem[]) || []).map(
-      (item: MemorySearchItem) => ({
-        id: String(item.id),
-        text: item.memory,
-        categories: item.categories || [],
-      })
-    );
-    createMemoryModal(memoryItems, false);
-  },
-
-  onError: function () {
-    if (memoryModalShown) {
-      createMemoryModal([], false);
-    }
-  },
-
-  minLength: 3,
-  debounceMs: 75,
-  cacheTTL: 60000,
-});
-
-let perplexityBackgroundSearchHandler: (() => void) | null = null;
-function hookPerplexityBackgroundSearchTyping() {
-  const textarea = getTextarea();
-  if (!textarea) {
-    return;
+// Function to close modal
+function closeModal() {
+  if (memoryModalShown && currentModalOverlay) {
+    document.body.removeChild(currentModalOverlay);
+    memoryModalShown = false;
+    // Reset modal position when closing
+    modalPosition = { top: null, left: null };
   }
-
-  if (textarea.dataset.perplexityBackgroundHooked) {
-    return;
-  }
-  textarea.dataset.perplexityBackgroundHooked = 'true';
-
-  if (!perplexityBackgroundSearchHandler) {
-    perplexityBackgroundSearchHandler = function () {
-      const text = getInputText(textarea).trim();
-      (perplexitySearch as { setText: (text: string) => void }).setText(text);
-    };
-  }
-  textarea.addEventListener('input', perplexityBackgroundSearchHandler);
-  textarea.addEventListener('keyup', perplexityBackgroundSearchHandler);
-}
-
-function getTextarea(): HTMLElement | null {
-  return (
-    document.querySelector('textarea[id="ask-input"]') || // Follow-up screen textarea
-    document.querySelector('textarea[placeholder="Ask a follow-up…"]') || // Follow-up screen textarea
-    document.querySelector('div[contenteditable="true"][id="ask-input"]') || // Main screen Lexical editor
-    document.querySelector('div[contenteditable="true"][aria-placeholder="Ask anything…"]') || // Main screen Lexical editor
-    document.querySelector('textarea[placeholder="Ask anything…"]') // Fallback for older versions
-  );
-}
-
-// Helper function to get text content from either textarea or contenteditable div
-function getInputText(inputElement: HTMLElement | null): string {
-  if (!inputElement) {
-    return '';
-  }
-
-  if (inputElement.tagName === 'TEXTAREA') {
-    return (inputElement as HTMLTextAreaElement).value || '';
-  } else if (inputElement.contentEditable === 'true') {
-    // For Lexical editor, properly handle the structure
-    const paragraph = inputElement.querySelector('p[dir="ltr"]') as HTMLElement | null;
-    if (paragraph) {
-      let text = '';
-      const childNodes = paragraph.childNodes;
-
-      for (let i = 0; i < childNodes.length; i++) {
-        const node = childNodes[i] as HTMLElement | Node;
-        if (node.nodeType === Node.TEXT_NODE) {
-          text += node.textContent || '';
-        } else if (
-          (node as HTMLElement).tagName === 'SPAN' &&
-          (node as HTMLElement).getAttribute('data-lexical-text') === 'true'
-        ) {
-          text += (node as HTMLElement).textContent || '';
-        } else if ((node as HTMLElement).tagName === 'BR') {
-          text += '\n';
-        }
-      }
-
-      return text;
-    }
-
-    // Fallback to textContent if structure is different
-    return inputElement.textContent || '';
-  }
-
-  return '';
-}
-
-// Helper function to set text content for either textarea or contenteditable div
-function setInputText(inputElement: HTMLElement | null, text: string): void {
-  console.log('setInputText called with text:', text);
-  console.log('inputElement:', inputElement);
-
-  if (!inputElement) {
-    console.log('No input element, returning');
-    return;
-  }
-
-  if (inputElement.tagName === 'TEXTAREA') {
-    console.log('Using textarea approach');
-    (inputElement as HTMLTextAreaElement).value = text;
-    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-  } else if (inputElement.contentEditable === 'true') {
-    console.log('Using contenteditable approach for Lexical editor');
-
-    // New approach: Use clipboard with actual paste event
-    console.log('Attempting clipboard-based approach');
-
-    // Focus the input first
-    inputElement.focus();
-
-    // Select all existing content
-    document.execCommand('selectAll', false, '');
-
-    // Try to write to clipboard and then trigger paste
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      console.log('Using modern Clipboard API');
-      navigator.clipboard
-        .writeText(text)
-        .then(() => {
-          console.log('Text written to clipboard successfully');
-
-          // Wait a bit then trigger paste
-          setTimeout(() => {
-            // Create and dispatch a paste event
-            const pasteEvent = new ClipboardEvent('paste', {
-              bubbles: true,
-              cancelable: true,
-              clipboardData: new DataTransfer(),
-            });
-
-            // Add the text to clipboard data
-            if (pasteEvent.clipboardData) {
-              pasteEvent.clipboardData.setData('text/plain', text);
-            }
-
-            console.log('Dispatching paste event');
-            const pasteResult = inputElement.dispatchEvent(pasteEvent);
-            console.log('Paste event result:', pasteResult);
-
-            // Check if it worked
-            setTimeout(() => {
-              console.log('Content after paste event:', getInputText(inputElement));
-
-              // If paste event didn't work, try execCommand paste
-              if (!getInputText(inputElement).includes(text.substring(0, 10))) {
-                console.log('Paste event failed, trying execCommand paste');
-                const execPasteResult = document.execCommand('paste');
-                console.log('execCommand paste result:', execPasteResult);
-
-                setTimeout(() => {
-                  console.log('Content after execCommand paste:', getInputText(inputElement));
-
-                  // If still not working, try the typing simulation
-                  if (!getInputText(inputElement).includes(text.substring(0, 10))) {
-                    console.log('All clipboard approaches failed, trying typing simulation');
-                    simulateTyping(inputElement, text);
-                  }
-                }, 100);
-              }
-            }, 100);
-          }, 100);
-        })
-        .catch(error => {
-          console.log('Clipboard write failed:', error);
-          // Fallback to typing simulation
-          simulateTyping(inputElement, text);
-        });
-    } else {
-      console.log('Clipboard API not available, falling back to typing simulation');
-      simulateTyping(inputElement, text);
-    }
-  }
-}
-
-// Helper function to simulate typing using Selection API
-function simulateTyping(inputElement: HTMLElement, text: string): void {
-  console.log('simulateTyping called with text:', text);
-  console.log('inputElement:', inputElement);
-
-  inputElement.focus();
-  console.log('Input element focused');
-
-  // Try using Selection API with Range to insert text
-  const selection = window.getSelection();
-
-  // Clear existing content by selecting all
-  if (!selection) {
-    return;
-  }
-  selection.selectAllChildren(inputElement);
-  console.log('Selected all children');
-
-  // Try to delete existing content first
-  selection.deleteFromDocument();
-  console.log('Deleted existing content');
-
-  // Now try to insert the new text using different methods
-
-  // Method 1: Try using insertText with Selection API
-  console.log('Attempting Method 1: Selection API insertText');
-  try {
-    if (!selection) {
-      throw new Error('No selection');
-    }
-    const range = selection.getRangeAt(0);
-    range.deleteContents();
-    range.insertNode(document.createTextNode(text));
-    console.log('Method 1 succeeded - inserted text node');
-    console.log('Content after Method 1:', getInputText(inputElement));
-
-    // If this worked, we're done
-    if (getInputText(inputElement).includes(text.substring(0, 10))) {
-      console.log('Method 1 worked! Content updated successfully');
-      return;
-    }
-  } catch (error) {
-    console.log('Method 1 failed:', error);
-  }
-
-  // Method 2: Try using execCommand with composition events
-  console.log('Attempting Method 2: execCommand with composition');
-  try {
-    // Start composition
-    const compositionStart = new CompositionEvent('compositionstart', {
-      bubbles: true,
-      cancelable: true,
-      data: '',
-    });
-    inputElement.dispatchEvent(compositionStart);
-
-    // Update composition
-    const compositionUpdate = new CompositionEvent('compositionupdate', {
-      bubbles: true,
-      cancelable: true,
-      data: text,
-    });
-    inputElement.dispatchEvent(compositionUpdate);
-
-    // End composition
-    const compositionEnd = new CompositionEvent('compositionend', {
-      bubbles: true,
-      cancelable: true,
-      data: text,
-    });
-    inputElement.dispatchEvent(compositionEnd);
-
-    console.log('Method 2 composition events dispatched');
-    console.log('Content after Method 2:', getInputText(inputElement));
-
-    // If this worked, we're done
-    if (getInputText(inputElement).includes(text.substring(0, 10))) {
-      console.log('Method 2 worked! Content updated successfully');
-      return;
-    }
-  } catch (error) {
-    console.log('Method 2 failed:', error);
-  }
-
-  // Method 3: Try direct DOM manipulation with mutation observer disabled
-  console.log('Attempting Method 3: Direct DOM manipulation');
-  try {
-    // Find or create the paragraph structure
-    let paragraph = inputElement.querySelector('p[dir="ltr"]');
-    if (!paragraph) {
-      paragraph = document.createElement('p');
-      paragraph.setAttribute('dir', 'ltr');
-      inputElement.appendChild(paragraph);
-    }
-
-    // Create a span with the text
-    const span = document.createElement('span');
-    span.setAttribute('data-lexical-text', 'true');
-    span.textContent = text;
-
-    // Clear existing content and add new span
-    paragraph.innerHTML = '';
-    paragraph.appendChild(span);
-
-    console.log('Method 3 DOM manipulation completed');
-    console.log('Content after Method 3:', getInputText(inputElement));
-
-    // Dispatch events to notify Lexical
-    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-    inputElement.dispatchEvent(new Event('change', { bubbles: true }));
-
-    // If this worked, we're done
-    if (getInputText(inputElement).includes(text.substring(0, 10))) {
-      console.log('Method 3 worked! Content updated successfully');
-      return;
-    }
-  } catch (error) {
-    console.log('Method 3 failed:', error);
-  }
-
-  // Method 4: Try using keyboard simulation
-  console.log('Attempting Method 4: Keyboard simulation');
-  try {
-    // Clear content with Ctrl+A and Delete
-    inputElement.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true })
-    );
-    inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
-
-    // Type each character with keyboard events
-    for (let i = 0; i < text.length; i++) {
-      const char = text.charAt(i);
-      inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-      inputElement.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
-      inputElement.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
-    }
-
-    console.log('Method 4 keyboard simulation completed');
-    console.log('Content after Method 4:', getInputText(inputElement));
-  } catch (error) {
-    console.log('Method 4 failed:', error);
-  }
-
-  console.log('All methods attempted. Final content:', getInputText(inputElement));
-}
-
-// Function to add the mem0 button to the UI
-async function addMem0Button() {
-  // First check if memory is enabled
-  const memoryEnabled = await getMemoryEnabledState();
-  if (!memoryEnabled) {
-    // If memory is disabled, remove the button if it exists
-    const existingButton = document.querySelector('.mem0-button-wrapper');
-    if (existingButton) {
-      existingButton.remove();
-    }
-    return;
-  }
-
-  // Prefer OPENMEMORY_UI mounts; if available, use them instead of manual injection
-  if (OPENMEMORY_UI && OPENMEMORY_UI.mountOnEditorFocus) {
-    try {
-      if (!document.getElementById('mem0-icon-button')) {
-        OPENMEMORY_UI.resolveCachedAnchor(
-          { learnKey: location.host + ':' + location.pathname },
-          null,
-          24 * 60 * 60 * 1000
-        ).then(function (hit: { el: Element; placement: Placement | null } | null) {
-          if (!hit || !hit.el) {
-            return;
-          }
-          let hs = OPENMEMORY_UI.createShadowRootHost('mem0-root');
-          let host = hs.host,
-            shadow = hs.shadow;
-          host.id = 'mem0-icon-button';
-          const cfg =
-            typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-              ? SITE_CONFIG.perplexity
-              : null;
-          let placement = hit.placement ||
-            (cfg && cfg.placement) || {
-              strategy: 'inline',
-              where: 'beforeend',
-              inlineAlign: 'end',
-            };
-          OPENMEMORY_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
-          let style = document.createElement('style');
-          style.textContent = `
-              :host { position: relative; }
-              .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-              .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-              .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-              :host([data-has-text="1"]) .dot { display:block; }
-            `;
-          let btn = document.createElement('button');
-          btn.className = 'mem0-btn';
-          let img = document.createElement('img');
-          img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-          let dot = document.createElement('div');
-          dot.className = 'dot';
-          btn.appendChild(img);
-          shadow.append(style, btn, dot);
-          btn.addEventListener('click', function () {
-            handleMem0Modal();
-          });
-          if (typeof updateNotificationDot === 'function') {
-            setTimeout(updateNotificationDot, 0);
-          }
-
-          try {
-            const cfg =
-              typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-                ? SITE_CONFIG.perplexity
-                : null;
-            let modelSel = cfg && cfg.modelButtonSelector;
-            let sendSel = cfg && cfg.sendButtonSelector;
-            let modelBtn = modelSel ? document.querySelector(modelSel) : null;
-            let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
-            if (anchorBtn) {
-              let container = anchorBtn.parentElement || anchorBtn;
-              let probe: Element | null = container;
-              let hops = 0;
-              while (probe && hops < 5) {
-                let cs = getComputedStyle(probe);
-                if (cs.display === 'flex' && cs.flexDirection !== 'column') {
-                  container = probe as HTMLElement;
-                  break;
-                }
-                probe = probe.parentElement;
-                hops++;
-              }
-              if (modelBtn) {
-                container.insertBefore(host, anchorBtn.nextSibling);
-              } else {
-                if (host.parentElement !== container || host !== container.firstElementChild) {
-                  container.insertBefore(host, container.firstElementChild || anchorBtn);
-                }
-              }
-              host.style.marginLeft = '0';
-              host.style.marginRight = '0';
-              if (OPENMEMORY_UI && OPENMEMORY_UI.saveAnchorHint) {
-                try {
-                  OPENMEMORY_UI.saveAnchorHint(
-                    { learnKey: location.host + ':' + location.pathname },
-                    container,
-                    { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-                    true
-                  );
-                } catch (_) {
-                  // Ignore errors during re-initialization
-                }
-              }
-            }
-          } catch (_) {
-            // Ignore errors during re-initialization
-          }
-        });
-      }
-    } catch (_) {
-      // Ignore errors during re-initialization
-    }
-
-    OPENMEMORY_UI.mountOnEditorFocus({
-      existingHostSelector: '#mem0-icon-button, .mem0-root',
-      editorSelector:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.perplexity &&
-        SITE_CONFIG.perplexity.editorSelector
-          ? SITE_CONFIG.perplexity.editorSelector
-          : 'textarea, [contenteditable], input[type="text"]',
-      deriveAnchor:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.perplexity &&
-        typeof SITE_CONFIG.perplexity.deriveAnchor === 'function'
-          ? SITE_CONFIG.perplexity.deriveAnchor
-          : function (editor: Element) {
-              return editor.closest('form') || editor.parentElement;
-            },
-      placement:
-        typeof SITE_CONFIG !== 'undefined' &&
-        SITE_CONFIG.perplexity &&
-        SITE_CONFIG.perplexity.placement
-          ? SITE_CONFIG.perplexity.placement
-          : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
-      render: function (shadow: ShadowRoot, host: HTMLElement) {
-        host.id = 'mem0-icon-button';
-        let style = document.createElement('style');
-        style.textContent = `
-          :host { position: relative; }
-          .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-          .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-          .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-          :host([data-has-text="1"]) .dot { display:block; }
-        `;
-        let btn = document.createElement('button');
-        btn.className = 'mem0-btn';
-        let img = document.createElement('img');
-        img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-        let dot = document.createElement('div');
-        dot.className = 'dot';
-        btn.appendChild(img);
-        shadow.append(style, btn, dot);
-        btn.addEventListener('click', function () {
-          handleMem0Modal();
-        });
-        if (typeof updateNotificationDot === 'function') {
-          setTimeout(updateNotificationDot, 0);
-        }
-
-        try {
-          // Dedupe existing hosts, keep the current one
-          Array.from(document.querySelectorAll('#mem0-icon-button, .mem0-root'))
-            .filter(function (n) {
-              return n !== host;
-            })
-            .forEach(function (n) {
-              try {
-                n.remove();
-              } catch (_) {
-                // Ignore errors during re-initialization
-              }
-            });
-          let cfg =
-            typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-              ? SITE_CONFIG.perplexity
-              : null;
-          let modelSel = cfg && cfg.modelButtonSelector;
-          let sendSel = cfg && cfg.sendButtonSelector;
-          let modelBtn = modelSel ? document.querySelector(modelSel) : null;
-          let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
-          if (anchorBtn) {
-            let container = anchorBtn.parentElement || anchorBtn;
-            let probe: Element | null = container;
-            let hops = 0;
-            while (probe && hops < 5) {
-              let cs = getComputedStyle(probe);
-              if (cs.display === 'flex' && cs.flexDirection !== 'column') {
-                container = probe as HTMLElement;
-                break;
-              }
-              probe = probe.parentElement;
-              hops++;
-            }
-            // Always place as the left-most icon in the group
-            let first = container.firstElementChild || anchorBtn;
-            if (host.parentElement !== container || host !== first) {
-              container.insertBefore(host, first);
-            }
-            let gap = getComputedStyle(container).gap;
-            if (!gap || gap === 'normal') {
-              gap = '8px';
-            }
-            host.style.marginLeft = gap;
-            host.style.marginRight = '0';
-          }
-        } catch (_) {
-          // Ignore errors during re-initialization
-        }
-      },
-      fallback: function () {
-        let cfg =
-          typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-            ? SITE_CONFIG.perplexity
-            : null;
-        return OPENMEMORY_UI.mountResilient({
-          anchors: [
-            {
-              find: function () {
-                let sel =
-                  (cfg && cfg.editorSelector) || 'textarea, [contenteditable], input[type="text"]';
-                let ed = document.querySelector(sel);
-                if (!ed) {
-                  return null;
-                }
-                try {
-                  return cfg && typeof cfg.deriveAnchor === 'function'
-                    ? cfg.deriveAnchor(ed)
-                    : ed.closest('form') || ed.parentElement;
-                } catch (_) {
-                  // Ignore errors during re-initialization
-                  return ed.closest('form') || ed.parentElement;
-                }
-              },
-            },
-          ],
-          placement: (cfg && cfg.placement) || {
-            strategy: 'inline',
-            where: 'beforeend',
-            inlineAlign: 'end',
-          },
-          enableFloatingFallback: true,
-          render: function (shadow: ShadowRoot, host: HTMLElement) {
-            host.id = 'mem0-icon-button';
-            let style = document.createElement('style');
-            style.textContent = `
-              :host { position: relative; }
-              .mem0-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
-              .mem0-btn img { width:18px; height:18px; border-radius:50%; }
-              .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
-              :host([data-has-text="1"]) .dot { display:block; }
-            `;
-            let btn = document.createElement('button');
-            btn.className = 'mem0-btn';
-            let img = document.createElement('img');
-            img.src = chrome.runtime.getURL('icons/mem0-claude-icon-p.png');
-            let dot = document.createElement('div');
-            dot.className = 'dot';
-            btn.appendChild(img);
-            shadow.append(style, btn, dot);
-            btn.addEventListener('click', function () {
-              handleMem0Modal();
-            });
-            if (typeof updateNotificationDot === 'function') {
-              setTimeout(updateNotificationDot, 0);
-            }
-
-            try {
-              Array.from(document.querySelectorAll('#mem0-icon-button, .mem0-root'))
-                .filter(function (n) {
-                  return n !== host;
-                })
-                .forEach(function (n) {
-                  try {
-                    n.remove();
-                  } catch (_) {
-                    // Ignore errors during re-initialization
-                  }
-                });
-              let cfg =
-                typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-                  ? SITE_CONFIG.perplexity
-                  : null;
-              let modelSel = cfg && cfg.modelButtonSelector;
-              let sendSel = cfg && cfg.sendButtonSelector;
-              let modelBtn = modelSel ? document.querySelector(modelSel) : null;
-              let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
-              if (anchorBtn) {
-                let container = anchorBtn.parentElement || anchorBtn;
-                let probe: Element | null = container;
-                let hops = 0;
-                while (probe && hops < 5) {
-                  let cs = getComputedStyle(probe);
-                  if (cs.display === 'flex' && cs.flexDirection !== 'column') {
-                    container = probe as HTMLElement;
-                    break;
-                  }
-                  probe = probe.parentElement;
-                  hops++;
-                }
-                if (modelBtn) {
-                  container.insertBefore(host, anchorBtn.nextSibling);
-                } else {
-                  if (host.parentElement !== container || host.nextSibling !== anchorBtn) {
-                    container.insertBefore(host, anchorBtn);
-                  }
-                }
-                let gap = getComputedStyle(container).gap;
-                if (!gap || gap === 'normal') {
-                  gap = '8px';
-                }
-                host.style.marginLeft = gap;
-                host.style.marginRight = '0';
-              }
-            } catch (_) {
-              // Ignore errors during re-initialization
-            }
-          },
-        });
-      },
-    });
-    return;
-  }
-
-  // Create a wrapper for the button and tooltip
-  const mem0ButtonWrapper = document.createElement('div');
-  mem0ButtonWrapper.className = 'mem0-button-wrapper';
-  mem0ButtonWrapper.style.cssText = `
-    position: relative;
-    display: inline-block;
-  `;
-
-  // Create tooltip element
-  const tooltip = document.createElement('div');
-  tooltip.className = 'mem0-tooltip';
-  tooltip.style.cssText = `
-    visibility: hidden;
-    background-color: #27272A;
-    color: #fff;
-    text-align: center;
-    border-radius: 6px;
-    padding: 6px 10px;
-    position: absolute;
-    z-index: 10000;
-    bottom: 125%;
-    left: 50%;
-    transform: translateX(-50%);
-    opacity: 0;
-    transition: opacity 0.3s;
-    font-size: 12px;
-    white-space: nowrap;
-    pointer-events: none;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-    border: 1px solid #3B3B3F;
-  `;
-  tooltip.textContent = 'Add memories to your prompt';
-
-  // Add tooltip arrow
-  const tooltipArrow = document.createElement('div');
-  tooltipArrow.style.cssText = `
-    content: "";
-    position: absolute;
-    top: 100%;
-    left: 50%;
-    margin-left: -5px;
-    border-width: 5px;
-    border-style: solid;
-    border-color: #27272A transparent transparent transparent;
-  `;
-
-  tooltip.appendChild(tooltipArrow);
-  mem0ButtonWrapper.appendChild(tooltip);
-
-  // Create the mem0 button
-  const mem0Button = document.createElement('button');
-  mem0Button.className =
-    'mem0-claude-btn focus-visible:bg-offsetPlus dark:focus-visible:bg-offsetPlusDark hover:bg-offsetPlus text-textOff dark:text-textOffDark hover:text-textMain dark:hover:bg-offsetPlusDark dark:hover:text-textMainDark font-sans focus:outline-none outline-none outline-transparent transition duration-300 ease-out font-sans select-none items-center relative group/button justify-center text-center items-center rounded-lg cursor-pointer active:scale-[0.97] active:duration-150 active:ease-outExpo origin-center whitespace-nowrap inline-flex text-sm h-8 aspect-[9/8]';
-  mem0Button.setAttribute('aria-label', 'Mem0 AI');
-  mem0Button.setAttribute('type', 'button');
-  mem0Button.style.position = 'relative';
-
-  // Create notification dot
-  const notificationDot = document.createElement('div');
-  notificationDot.id = 'mem0-notification-dot';
-  notificationDot.style.cssText = `
-    position: absolute;
-    top: -3px;
-    right: -3px;
-    width: 10px;
-    height: 10px;
-    background-color: rgb(128, 221, 162);
-    border-radius: 50%;
-    border: 2px solid #18181B;
-    display: none;
-    z-index: 1001;
-    pointer-events: none;
-  `;
-
-  // Add keyframe animation for the dot
-  if (!document.getElementById('notification-dot-animation')) {
-    const style = document.createElement('style');
-    style.id = 'notification-dot-animation';
-    style.innerHTML = `
-      @keyframes popIn {
-        0% { transform: scale(0); }
-        50% { transform: scale(1.2); }
-        100% { transform: scale(1); }
-      }
-      
-      #mem0-notification-dot.active {
-        display: block !important;
-        animation: popIn 0.3s ease-out forwards;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  // Create inner structure similar to other buttons
-  mem0Button.innerHTML = `
-    <div class="flex items-center min-w-0 font-medium gap-1.5 justify-center">
-      <div class="flex shrink-0 items-center justify-center size-4">
-        <img src="${chrome.runtime.getURL('icons/mem0-claude-icon-p.png')}" alt="Mem0 AI" width="14" height="14" />
-      </div>
-    </div>
-  `;
-
-  // Add the notification dot to the button
-  mem0Button.appendChild(notificationDot);
-  // Try to find the right-side icons container near the submit button and prepend there
-  let iconsContainer = null;
-  let modelBtn = null;
-  try {
-    // Prefer explicit model button from site config
-    try {
-      let cfg =
-        typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
-          ? SITE_CONFIG.perplexity
-          : null;
-      let modelSel = cfg && cfg.modelButtonSelector;
-      if (modelSel) {
-        modelBtn = document.querySelector(modelSel);
-      }
-    } catch (_) {
-      // Ignore errors during re-initialization
-    }
-
-    // 1) Exact class combo (from screenshot) – Tailwind classes require escaping ':'
-    iconsContainer = document.querySelector(
-      'div.bg-raised.dark\\:bg-offset.flex.items-center.justify-self-end.rounded-full'
-    );
-    // 2) Slightly relaxed class combo
-    if (!iconsContainer) {
-      iconsContainer = document.querySelector('div.bg-raised.flex.items-center.rounded-full');
-    }
-    // 3) Attribute-contains selector as a robust fallback
-    if (!iconsContainer) {
-      iconsContainer = document.querySelector(
-        'div[class*="bg-raised"][class*="items-center"][class*="rounded-full"]'
-      );
-    }
-    // 4) Fallback based on Submit button proximity
-    if (!iconsContainer) {
-      const submitBtn = document.querySelector('button[aria-label="Submit"]');
-      if (submitBtn && submitBtn.parentElement) {
-        const sibling = submitBtn.parentElement.previousElementSibling;
-        if (sibling && sibling.querySelectorAll('button').length > 0) {
-          iconsContainer = sibling;
-        }
-        if (!iconsContainer) {
-          const candidates = submitBtn.parentElement.querySelectorAll('div');
-          for (const c of Array.from(candidates)) {
-            if (c.querySelectorAll('button').length >= 2) {
-              iconsContainer = c;
-              break;
-            }
-          }
-        }
-      }
-    }
-  } catch (_) {
-    // Ignore errors during re-initialization
-  }
-
-  // If model button found, insert right after it; else, insert at start of icon group
-  if (modelBtn && modelBtn.parentElement) {
-    let container = modelBtn.parentElement;
-    // If the immediate parent is not a horizontal flex, walk up a few levels to find one
-    try {
-      let probe: Element | null = container;
-      let hops = 0;
-      while (probe && hops < 5) {
-        let cs = getComputedStyle(probe);
-        if (cs.display === 'flex' && cs.flexDirection !== 'column') {
-          container = probe as HTMLElement;
-          break;
-        }
-        probe = probe.parentElement;
-        hops++;
-      }
-    } catch (_) {
-      // Ignore errors during re-initialization
-    }
-    // Place as the first icon in the group
-    container.insertBefore(mem0ButtonWrapper, container.firstElementChild);
-  } else if (iconsContainer) {
-    iconsContainer.insertBefore(mem0ButtonWrapper, iconsContainer.firstChild);
-  }
-
-  // Add the button to the wrapper first
-  mem0ButtonWrapper.appendChild(mem0Button);
-
-  // Find the input container and insert the button to the LEFT of the input
-  let inputContainer: HTMLElement | null = null;
-  const inputEl = getTextarea();
-
-  if (inputEl) {
-    // Try to find the input container by looking for the parent that contains the input
-    let currentElement: HTMLElement | null = inputEl as HTMLElement;
-    while (currentElement && currentElement !== document.body) {
-      // Look for a container that has flex layout and contains the input
-      const computedStyle = window.getComputedStyle(currentElement);
-      if (computedStyle.display === 'flex' && currentElement.contains(inputEl)) {
-        inputContainer = currentElement;
-        break;
-      }
-      currentElement = currentElement.parentElement;
-    }
-
-    // Fallback: use the direct parent of the input
-    if (!inputContainer) {
-      inputContainer = inputEl.parentElement;
-    }
-  }
-
-  if (!inputContainer) {
-    setTimeout(addMem0Button, 500);
-    return;
-  }
-
-  // Insert the button as the FIRST child of the input container (leftmost position)
-  inputContainer.insertBefore(mem0ButtonWrapper, inputContainer.firstChild);
-
-  // Style the button to match the input area
-  mem0Button.style.width = '32px';
-  mem0Button.style.height = '32px';
-  mem0Button.style.borderRadius = '8px';
-  mem0Button.style.background = 'transparent';
-  mem0Button.style.display = 'inline-flex';
-  mem0Button.style.alignItems = 'center';
-  mem0Button.style.justifyContent = 'center';
-  mem0Button.style.marginRight = '8px';
-  mem0ButtonWrapper.style.display = 'inline-flex';
-  mem0ButtonWrapper.style.alignItems = 'center';
-  mem0ButtonWrapper.style.justifyContent = 'center';
-
-  // Add hover effect for tooltip
-  mem0ButtonWrapper.addEventListener('mouseenter', () => {
-    tooltip.style.visibility = 'visible';
-    tooltip.style.opacity = '1';
-  });
-
-  mem0ButtonWrapper.addEventListener('mouseleave', () => {
-    tooltip.style.visibility = 'hidden';
-    tooltip.style.opacity = '0';
-  });
-
-  // Add click event listener - modified to check login first and fix empty text case
-  mem0Button.addEventListener('click', () => {
-    // Get the current input text
-    const textarea = getTextarea();
-
-    if (textarea && getInputText(textarea).trim()) {
-      // If there's text in the input, process memories
-      handleMem0Modal('mem0-icon-button');
-    } else {
-      // If no text, check login status first
-      chrome.storage.sync.get(
-        [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
-        function (items) {
-          if (!items.apiKey && !items.access_token) {
-            // Not logged in, show login popup
-            showLoginPopup();
-          } else {
-            // Logged in but no text, show tooltip message
-            const originalText = tooltip.textContent;
-            tooltip.textContent = 'Add some text to find memories';
-            tooltip.style.visibility = 'visible';
-            tooltip.style.opacity = '1';
-
-            // Reset the tooltip after a delay
-            setTimeout(() => {
-              tooltip.textContent = originalText;
-              if (!mem0ButtonWrapper.matches(':hover')) {
-                tooltip.style.visibility = 'hidden';
-                tooltip.style.opacity = '0';
-              }
-            }, 1500);
-          }
-        }
-      );
-    }
-  });
-
-  // Setup the notification dot based on input content
-  updateNotificationDot();
-}
-
-// Function to update the notification dot based on input content
-function updateNotificationDot() {
-  const textarea = getTextarea();
-  const host = document.getElementById('mem0-icon-button');
-  if (!textarea || !host) {
-    setTimeout(updateNotificationDot, 500);
-    return;
-  }
-
-  const applyState = () => {
-    const inputText = getInputText(textarea) || '';
-    const hasText = inputText.trim() !== '';
-    try {
-      host.setAttribute('data-has-text', hasText ? '1' : '0');
-    } catch (_) {
-      // Ignore errors during re-initialization
-    }
-  };
-
-  // Observe and listen for changes
-  try {
-    const mo = new MutationObserver(applyState);
-    mo.observe(textarea, { attributes: true, childList: true, characterData: true, subtree: true });
-  } catch (_) {
-    // Ignore errors during re-initialization
-  }
-
-  if (!textarea.dataset.perplexityApplyStateHooked) {
-    textarea.dataset.perplexityApplyStateHooked = 'true';
-    textarea.addEventListener('input', applyState);
-    textarea.addEventListener('keyup', applyState);
-    textarea.addEventListener('focus', applyState);
-  }
-  applyState();
-  setTimeout(applyState, 300);
 }
 
 // Function to create memory modal
@@ -1101,10 +80,10 @@ function createMemoryModal(
     leftPosition = modalPosition.left;
   } else {
     // Different positioning based on which button triggered the modal
-    if (sourceButtonId === 'mem0-icon-button') {
+    if (sourceButtonId === 'rememberme-icon-button') {
       // Anchor to the Mem0 host/button in the right icon group when present
       const iconButton =
-        document.querySelector('#mem0-icon-button') || document.querySelector('.mem0-claude-btn');
+        document.querySelector('#rememberme-icon-button') || document.querySelector('.mem0-claude-btn');
       if (iconButton) {
         const buttonRect = iconButton.getBoundingClientRect();
 
@@ -1129,7 +108,7 @@ function createMemoryModal(
   function positionDefault() {
     // Prefer the actual Mem0 host if present; otherwise, try to use the right icon group container
     let anchor =
-      document.querySelector('#mem0-icon-button') || document.querySelector('.mem0-claude-btn');
+      document.querySelector('#rememberme-icon-button') || document.querySelector('.mem0-claude-btn');
     if (!anchor) {
       // Heuristics to find the right-side icon group near the submit button
       try {
@@ -1243,7 +222,7 @@ function createMemoryModal(
 
   // Add Mem0 logo and title to header
   const logoImg = document.createElement('img');
-  logoImg.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logoImg.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logoImg.style.cssText = `
     width: 26px;
     height: 26px;
@@ -1252,7 +231,7 @@ function createMemoryModal(
 
   // Create title element
   const title = document.createElement('div');
-  title.textContent = 'OpenMemory';
+  title.textContent = 'RememberMe';
   title.style.cssText = `
     font-size: 16px;
     font-weight: 600;
@@ -1307,7 +286,7 @@ function createMemoryModal(
 
     sendExtensionEvent('memory_injection', {
       provider: 'perplexity',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
       injected_all: true,
       memory_count: newMemories.length,
@@ -1347,7 +326,7 @@ function createMemoryModal(
   `;
   settingsBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" xmlns="http://www.w3.org/2000/svg">
     <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`;
 
   // Add click event to open app.mem0.ai in a new tab
@@ -1706,7 +685,7 @@ function createMemoryModal(
 
           sendExtensionEvent('memory_injection', {
             provider: 'perplexity',
-            source: 'OPENMEMORY_CHROME_EXTENSION',
+            source: 'REMEMBERME_CHROME_EXTENSION',
             browser: getBrowser(),
             injected_all: false,
             memory_id: memory.id,
@@ -2041,6 +1020,985 @@ function createMemoryModal(
   updateNavigationState(1, Math.ceil(memoryItems.length / memoriesPerPage));
 }
 
+// Platform configuration
+const perplexityConfig: PlatformConfig = {
+  provider: 'Perplexity',
+  inputSelectors: [
+    'textarea[id="ask-input"]',
+    'textarea[placeholder="Ask a follow-up…"]',
+    'div[contenteditable="true"][id="ask-input"]',
+    'div[contenteditable="true"][aria-placeholder="Ask anything…"]',
+    'textarea[placeholder="Ask anything…"]',
+  ],
+  sendButtonSelectors: ['button[aria-label="Submit"]'],
+  backgroundSearchHookAttribute: 'perplexityBackgroundHooked',
+  getInputValue: (element: HTMLElement | null) => {
+    if (!element) return '';
+    return getInputText(element);
+  },
+  getContentWithoutMemories: (text?: string) => {
+    if (text) {
+      if (text.includes('Here is some of my memories to help')) {
+        const parts = text.split('Here is some of my memories to help');
+        return (parts[0] || '').trim();
+      }
+      return text;
+    }
+    const textarea = getTextarea();
+    if (!textarea) return '';
+    let message = getInputText(textarea);
+    if (message.includes('Here is some of my memories to help')) {
+      const parts = message.split('Here is some of my memories to help');
+      message = (parts[0] || '').trim();
+    }
+    return message;
+  },
+  createMemoryModal: (items, isLoading, sourceButtonId) => {
+    createMemoryModal(items, isLoading, sourceButtonId);
+  },
+  onMemoryModalShown: (shown) => {
+    memoryModalShown = shown;
+  },
+  logPrefix: 'Perplexity',
+};
+
+const perplexitySearch = createPlatformSearchOrchestrator(perplexityConfig);
+
+const hookPerplexityBackgroundSearchTyping = setupBackgroundSearchHook(perplexityConfig, perplexitySearch);
+
+function getTextarea(): HTMLElement | null {
+  return (
+    document.querySelector('textarea[id="ask-input"]') || // Follow-up screen textarea
+    document.querySelector('textarea[placeholder="Ask a follow-up…"]') || // Follow-up screen textarea
+    document.querySelector('div[contenteditable="true"][id="ask-input"]') || // Main screen Lexical editor
+    document.querySelector('div[contenteditable="true"][aria-placeholder="Ask anything…"]') || // Main screen Lexical editor
+    document.querySelector('textarea[placeholder="Ask anything…"]') // Fallback for older versions
+  );
+}
+
+// Helper function to get text content from either textarea or contenteditable div
+function getInputText(inputElement: HTMLElement | null): string {
+  if (!inputElement) {
+    return '';
+  }
+
+  if (inputElement.tagName === 'TEXTAREA') {
+    return (inputElement as HTMLTextAreaElement).value || '';
+  } else if (inputElement.contentEditable === 'true') {
+    // For Lexical editor, properly handle the structure
+    const paragraph = inputElement.querySelector('p[dir="ltr"]') as HTMLElement | null;
+    if (paragraph) {
+      let text = '';
+      const childNodes = paragraph.childNodes;
+
+      for (let i = 0; i < childNodes.length; i++) {
+        const node = childNodes[i] as HTMLElement | Node;
+        if (node.nodeType === Node.TEXT_NODE) {
+          text += node.textContent || '';
+        } else if (
+          (node as HTMLElement).tagName === 'SPAN' &&
+          (node as HTMLElement).getAttribute('data-lexical-text') === 'true'
+        ) {
+          text += (node as HTMLElement).textContent || '';
+        } else if ((node as HTMLElement).tagName === 'BR') {
+          text += '\n';
+        }
+      }
+
+      return text;
+    }
+
+    // Fallback to textContent if structure is different
+    return inputElement.textContent || '';
+  }
+
+  return '';
+}
+
+// Helper function to set text content for either textarea or contenteditable div
+function setInputText(inputElement: HTMLElement | null, text: string): void {
+  console.log('setInputText called with text:', text);
+  console.log('inputElement:', inputElement);
+
+  if (!inputElement) {
+    console.log('No input element, returning');
+    return;
+  }
+
+  if (inputElement.tagName === 'TEXTAREA') {
+    console.log('Using textarea approach');
+    (inputElement as HTMLTextAreaElement).value = text;
+    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+  } else if (inputElement.contentEditable === 'true') {
+    console.log('Using contenteditable approach for Lexical editor');
+
+    // New approach: Use clipboard with actual paste event
+    console.log('Attempting clipboard-based approach');
+
+    // Focus the input first
+    inputElement.focus();
+
+    // Select all existing content
+    document.execCommand('selectAll', false, '');
+
+    // Try to write to clipboard and then trigger paste
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      console.log('Using modern Clipboard API');
+      navigator.clipboard
+        .writeText(text)
+        .then(() => {
+          console.log('Text written to clipboard successfully');
+
+          // Wait a bit then trigger paste
+          setTimeout(() => {
+            // Create and dispatch a paste event
+            const pasteEvent = new ClipboardEvent('paste', {
+              bubbles: true,
+              cancelable: true,
+              clipboardData: new DataTransfer(),
+            });
+
+            // Add the text to clipboard data
+            if (pasteEvent.clipboardData) {
+              pasteEvent.clipboardData.setData('text/plain', text);
+            }
+
+            console.log('Dispatching paste event');
+            const pasteResult = inputElement.dispatchEvent(pasteEvent);
+            console.log('Paste event result:', pasteResult);
+
+            // Check if it worked
+            setTimeout(() => {
+              console.log('Content after paste event:', getInputText(inputElement));
+
+              // If paste event didn't work, try execCommand paste
+              if (!getInputText(inputElement).includes(text.substring(0, 10))) {
+                console.log('Paste event failed, trying execCommand paste');
+                const execPasteResult = document.execCommand('paste');
+                console.log('execCommand paste result:', execPasteResult);
+
+                setTimeout(() => {
+                  console.log('Content after execCommand paste:', getInputText(inputElement));
+
+                  // If still not working, try the typing simulation
+                  if (!getInputText(inputElement).includes(text.substring(0, 10))) {
+                    console.log('All clipboard approaches failed, trying typing simulation');
+                    simulateTyping(inputElement, text);
+                  }
+                }, 100);
+              }
+            }, 100);
+          }, 100);
+        })
+        .catch(error => {
+          console.log('Clipboard write failed:', error);
+          // Fallback to typing simulation
+          simulateTyping(inputElement, text);
+        });
+    } else {
+      console.log('Clipboard API not available, falling back to typing simulation');
+      simulateTyping(inputElement, text);
+    }
+  }
+}
+
+// Helper function to simulate typing using Selection API
+function simulateTyping(inputElement: HTMLElement, text: string): void {
+  console.log('simulateTyping called with text:', text);
+  console.log('inputElement:', inputElement);
+
+  inputElement.focus();
+  console.log('Input element focused');
+
+  // Try using Selection API with Range to insert text
+  const selection = window.getSelection();
+
+  // Clear existing content by selecting all
+  if (!selection) {
+    return;
+  }
+  selection.selectAllChildren(inputElement);
+  console.log('Selected all children');
+
+  // Try to delete existing content first
+  selection.deleteFromDocument();
+  console.log('Deleted existing content');
+
+  // Now try to insert the new text using different methods
+
+  // Method 1: Try using insertText with Selection API
+  console.log('Attempting Method 1: Selection API insertText');
+  try {
+    if (!selection) {
+      throw new Error('No selection');
+    }
+    const range = selection.getRangeAt(0);
+    range.deleteContents();
+    range.insertNode(document.createTextNode(text));
+    console.log('Method 1 succeeded - inserted text node');
+    console.log('Content after Method 1:', getInputText(inputElement));
+
+    // If this worked, we're done
+    if (getInputText(inputElement).includes(text.substring(0, 10))) {
+      console.log('Method 1 worked! Content updated successfully');
+      return;
+    }
+  } catch (error) {
+    console.log('Method 1 failed:', error);
+  }
+
+  // Method 2: Try using execCommand with composition events
+  console.log('Attempting Method 2: execCommand with composition');
+  try {
+    // Start composition
+    const compositionStart = new CompositionEvent('compositionstart', {
+      bubbles: true,
+      cancelable: true,
+      data: '',
+    });
+    inputElement.dispatchEvent(compositionStart);
+
+    // Update composition
+    const compositionUpdate = new CompositionEvent('compositionupdate', {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+    });
+    inputElement.dispatchEvent(compositionUpdate);
+
+    // End composition
+    const compositionEnd = new CompositionEvent('compositionend', {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+    });
+    inputElement.dispatchEvent(compositionEnd);
+
+    console.log('Method 2 composition events dispatched');
+    console.log('Content after Method 2:', getInputText(inputElement));
+
+    // If this worked, we're done
+    if (getInputText(inputElement).includes(text.substring(0, 10))) {
+      console.log('Method 2 worked! Content updated successfully');
+      return;
+    }
+  } catch (error) {
+    console.log('Method 2 failed:', error);
+  }
+
+  // Method 3: Try direct DOM manipulation with mutation observer disabled
+  console.log('Attempting Method 3: Direct DOM manipulation');
+  try {
+    // Find or create the paragraph structure
+    let paragraph = inputElement.querySelector('p[dir="ltr"]');
+    if (!paragraph) {
+      paragraph = document.createElement('p');
+      paragraph.setAttribute('dir', 'ltr');
+      inputElement.appendChild(paragraph);
+    }
+
+    // Create a span with the text
+    const span = document.createElement('span');
+    span.setAttribute('data-lexical-text', 'true');
+    span.textContent = text;
+
+    // Clear existing content and add new span
+    paragraph.innerHTML = '';
+    paragraph.appendChild(span);
+
+    console.log('Method 3 DOM manipulation completed');
+    console.log('Content after Method 3:', getInputText(inputElement));
+
+    // Dispatch events to notify Lexical
+    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+    inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // If this worked, we're done
+    if (getInputText(inputElement).includes(text.substring(0, 10))) {
+      console.log('Method 3 worked! Content updated successfully');
+      return;
+    }
+  } catch (error) {
+    console.log('Method 3 failed:', error);
+  }
+
+  // Method 4: Try using keyboard simulation
+  console.log('Attempting Method 4: Keyboard simulation');
+  try {
+    // Clear content with Ctrl+A and Delete
+    inputElement.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true })
+    );
+    inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
+
+    // Type each character with keyboard events
+    for (let i = 0; i < text.length; i++) {
+      const char = text.charAt(i);
+      inputElement.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+      inputElement.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+      inputElement.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+    }
+
+    console.log('Method 4 keyboard simulation completed');
+    console.log('Content after Method 4:', getInputText(inputElement));
+  } catch (error) {
+    console.log('Method 4 failed:', error);
+  }
+
+  console.log('All methods attempted. Final content:', getInputText(inputElement));
+}
+
+// Function to add the mem0 button to the UI
+// COMMENTED OUT: Icon button injection - using notification-only approach
+async function addRememberMeButton() {
+  return;
+  // First check if memory is enabled
+  // const memoryEnabled = await getMemoryEnabledState();
+  // if (!memoryEnabled) {
+  //   // If memory is disabled, remove the button if it exists
+  //   const existingButton = document.querySelector('.mem0-button-wrapper');
+  //   if (existingButton) {
+  //     existingButton.remove();
+  //   }
+  //   return;
+  // }
+
+  // COMMENTED OUT: Icon button injection - using notification-only approach
+  // Prefer REMEMBERME_UI mounts; if available, use them instead of manual injection
+  // if (REMEMBERME_UI && REMEMBERME_UI.mountOnEditorFocus) {
+//     try {
+//       if (!document.getElementById('rememberme-icon-button')) {
+//         REMEMBERME_UI.resolveCachedAnchor(
+//           { learnKey: location.host + ':' + location.pathname },
+//           null,
+//           24 * 60 * 60 * 1000
+//         ).then(function (hit: { el: Element; placement: Placement | null } | null) {
+//           if (!hit || !hit.el) {
+//             return;
+//           }
+//           let hs = REMEMBERME_UI.createShadowRootHost('rememberme-root');
+//           let host = hs.host,
+//             shadow = hs.shadow;
+//           host.id = 'rememberme-icon-button';
+//           const cfg =
+//             typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+//               ? SITE_CONFIG.perplexity
+//               : null;
+//           let placement = hit.placement ||
+//             (cfg && cfg.placement) || {
+//               strategy: 'inline',
+//               where: 'beforeend',
+//               inlineAlign: 'end',
+//             };
+//           REMEMBERME_UI.applyPlacement({ container: host, anchor: hit.el, placement: placement });
+//           let style = document.createElement('style');
+//           style.textContent = `
+//               :host { position: relative; }
+//               .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+//               .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//               .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//               :host([data-has-text="1"]) .dot { display:block; }
+//             `;
+//           let btn = document.createElement('button');
+//           btn.className = 'rememberme-btn';
+//           let img = document.createElement('img');
+//           img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//           let dot = document.createElement('div');
+//           dot.className = 'dot';
+//           btn.appendChild(img);
+//           shadow.append(style, btn, dot);
+//           btn.addEventListener('click', function () {
+//             handleRememberMeModal();
+//           });
+//           if (typeof updateNotificationDot === 'function') {
+//             setTimeout(updateNotificationDot, 0);
+//           }
+// 
+//           try {
+//             const cfg =
+//               typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+//                 ? SITE_CONFIG.perplexity
+//                 : null;
+//             let modelSel = cfg && cfg.modelButtonSelector;
+//             let sendSel = cfg && cfg.sendButtonSelector;
+//             let modelBtn = modelSel ? document.querySelector(modelSel) : null;
+//             let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
+//             if (anchorBtn) {
+//               let container = anchorBtn.parentElement || anchorBtn;
+//               let probe: Element | null = container;
+//               let hops = 0;
+//               while (probe && hops < 5) {
+//                 let cs = getComputedStyle(probe);
+//                 if (cs.display === 'flex' && cs.flexDirection !== 'column') {
+//                   container = probe as HTMLElement;
+//                   break;
+//                 }
+//                 probe = probe.parentElement;
+//                 hops++;
+//               }
+//               if (modelBtn) {
+//                 container.insertBefore(host, anchorBtn.nextSibling);
+//               } else {
+//                 if (host.parentElement !== container || host !== container.firstElementChild) {
+//                   container.insertBefore(host, container.firstElementChild || anchorBtn);
+//                 }
+//               }
+//               host.style.marginLeft = '0';
+//               host.style.marginRight = '0';
+//               if (REMEMBERME_UI && REMEMBERME_UI.saveAnchorHint) {
+//                 try {
+//                   REMEMBERME_UI.saveAnchorHint(
+//                     { learnKey: location.host + ':' + location.pathname },
+//                     container,
+//                     { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
+//                     true
+//                   );
+//                 } catch (_) {
+//                   // Ignore errors during re-initialization
+//                 }
+//               }
+//             }
+//           } catch (_) {
+//             // Ignore errors during re-initialization
+//           }
+//         });
+//       }
+//     } catch (_) {
+//       // Ignore errors during re-initialization
+//     }
+// 
+// //     REMEMBERME_UI.mountOnEditorFocus({
+// //       existingHostSelector: '#rememberme-icon-button, .rememberme-root',
+// //       editorSelector:
+// //         typeof SITE_CONFIG !== 'undefined' &&
+// //         SITE_CONFIG.perplexity &&
+// //         SITE_CONFIG.perplexity.editorSelector
+// //           ? SITE_CONFIG.perplexity.editorSelector
+// //           : 'textarea, [contenteditable], input[type="text"]',
+// //       deriveAnchor:
+// //         typeof SITE_CONFIG !== 'undefined' &&
+// //         SITE_CONFIG.perplexity &&
+// //         typeof SITE_CONFIG.perplexity.deriveAnchor === 'function'
+// //           ? SITE_CONFIG.perplexity.deriveAnchor
+// //           : function (editor: Element) {
+// //               return editor.closest('form') || editor.parentElement;
+// //             },
+// //       placement:
+// //         typeof SITE_CONFIG !== 'undefined' &&
+// //         SITE_CONFIG.perplexity &&
+// //         SITE_CONFIG.perplexity.placement
+// //           ? SITE_CONFIG.perplexity.placement
+// //           : { strategy: 'inline', where: 'beforeend', inlineAlign: 'end' },
+// //       render: function (shadow: ShadowRoot, host: HTMLElement) {
+// //         host.id = 'rememberme-icon-button';
+// //         let style = document.createElement('style');
+// //         style.textContent = `
+// //           :host { position: relative; }
+// //           .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+// //           .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+// //           .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+// //           :host([data-has-text="1"]) .dot { display:block; }
+// //         `;
+// //         let btn = document.createElement('button');
+// //         btn.className = 'rememberme-btn';
+// //         let img = document.createElement('img');
+// //         img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+// //         let dot = document.createElement('div');
+// //         dot.className = 'dot';
+// //         btn.appendChild(img);
+// //         shadow.append(style, btn, dot);
+// //         btn.addEventListener('click', function () {
+// //           handleRememberMeModal();
+// //         });
+// //         if (typeof updateNotificationDot === 'function') {
+// //           setTimeout(updateNotificationDot, 0);
+// //         }
+// // 
+// //         try {
+// //           // Dedupe existing hosts, keep the current one
+// //           Array.from(document.querySelectorAll('#rememberme-icon-button, .rememberme-root'))
+// //             .filter(function (n) {
+// //               return n !== host;
+// //             })
+// //             .forEach(function (n) {
+// //               try {
+// //                 n.remove();
+// //               } catch (_) {
+// //                 // Ignore errors during re-initialization
+// //               }
+// //             });
+// //           let cfg =
+// //             typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+// //               ? SITE_CONFIG.perplexity
+// //               : null;
+// //           let modelSel = cfg && cfg.modelButtonSelector;
+// //           let sendSel = cfg && cfg.sendButtonSelector;
+// //           let modelBtn = modelSel ? document.querySelector(modelSel) : null;
+// //           let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
+// //           if (anchorBtn) {
+// //             let container = anchorBtn.parentElement || anchorBtn;
+// //             let probe: Element | null = container;
+// //             let hops = 0;
+// //             while (probe && hops < 5) {
+// //               let cs = getComputedStyle(probe);
+// //               if (cs.display === 'flex' && cs.flexDirection !== 'column') {
+// //                 container = probe as HTMLElement;
+// //                 break;
+// //               }
+// //               probe = probe.parentElement;
+// //               hops++;
+// //             }
+// //             // Always place as the left-most icon in the group
+// //             let first = container.firstElementChild || anchorBtn;
+// //             if (host.parentElement !== container || host !== first) {
+// //               container.insertBefore(host, first);
+// //             }
+// //             let gap = getComputedStyle(container).gap;
+// //             if (!gap || gap === 'normal') {
+// //               gap = '8px';
+// //             }
+// //             host.style.marginLeft = gap;
+// //             host.style.marginRight = '0';
+// //           }
+// //         } catch (_) {
+// //           // Ignore errors during re-initialization
+// //         }
+// //       },
+// //       fallback: function () {
+// //         let cfg =
+// //           typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+// //             ? SITE_CONFIG.perplexity
+// //             : null;
+// //         return REMEMBERME_UI.mountResilient({
+//           anchors: [
+//             {
+//               find: function () {
+//                 let sel =
+//                   (cfg && cfg.editorSelector) || 'textarea, [contenteditable], input[type="text"]';
+//                 let ed = document.querySelector(sel);
+//                 if (!ed) {
+//                   return null;
+//                 }
+//                 try {
+//                   return cfg && typeof cfg.deriveAnchor === 'function'
+//                     ? cfg.deriveAnchor(ed)
+//                     : ed.closest('form') || ed.parentElement;
+//                 } catch (_) {
+//                   // Ignore errors during re-initialization
+//                   return ed.closest('form') || ed.parentElement;
+//                 }
+//               },
+//             },
+//           ],
+//           placement: (cfg && cfg.placement) || {
+//             strategy: 'inline',
+//             where: 'beforeend',
+//             inlineAlign: 'end',
+//           },
+//           enableFloatingFallback: true,
+//           render: function (shadow: ShadowRoot, host: HTMLElement) {
+//             host.id = 'rememberme-icon-button';
+//             let style = document.createElement('style');
+//             style.textContent = `
+//               :host { position: relative; }
+//               .rememberme-btn { all: initial; cursor: pointer; display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; }
+//               .rememberme-btn img { width:18px; height:18px; border-radius:50%; }
+//               .dot { position:absolute; top:-2px; right:-2px; width:8px; height:8px; background:#80DDA2; border-radius:50%; border:2px solid #1C1C1E; display:none; }
+//               :host([data-has-text="1"]) .dot { display:block; }
+//             `;
+//             let btn = document.createElement('button');
+//             btn.className = 'rememberme-btn';
+//             let img = document.createElement('img');
+//             img.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+//             let dot = document.createElement('div');
+//             dot.className = 'dot';
+//             btn.appendChild(img);
+//             shadow.append(style, btn, dot);
+//             btn.addEventListener('click', function () {
+//               handleRememberMeModal();
+//             });
+//             if (typeof updateNotificationDot === 'function') {
+//               setTimeout(updateNotificationDot, 0);
+//             }
+// 
+//             try {
+//               Array.from(document.querySelectorAll('#rememberme-icon-button, .rememberme-root'))
+//                 .filter(function (n) {
+//                   return n !== host;
+//                 })
+//                 .forEach(function (n) {
+//                   try {
+//                     n.remove();
+//                   } catch (_) {
+//                     // Ignore errors during re-initialization
+//                   }
+//                 });
+//               let cfg =
+//                 typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+//                   ? SITE_CONFIG.perplexity
+//                   : null;
+//               let modelSel = cfg && cfg.modelButtonSelector;
+//               let sendSel = cfg && cfg.sendButtonSelector;
+//               let modelBtn = modelSel ? document.querySelector(modelSel) : null;
+//               let anchorBtn = modelBtn || (sendSel ? document.querySelector(sendSel) : null);
+//               if (anchorBtn) {
+//                 let container = anchorBtn.parentElement || anchorBtn;
+//                 let probe: Element | null = container;
+//                 let hops = 0;
+//                 while (probe && hops < 5) {
+//                   let cs = getComputedStyle(probe);
+//                   if (cs.display === 'flex' && cs.flexDirection !== 'column') {
+//                     container = probe as HTMLElement;
+//                     break;
+//                   }
+//                   probe = probe.parentElement;
+//                   hops++;
+//                 }
+//                 if (modelBtn) {
+//                   container.insertBefore(host, anchorBtn.nextSibling);
+//                 } else {
+//                   if (host.parentElement !== container || host.nextSibling !== anchorBtn) {
+//                     container.insertBefore(host, anchorBtn);
+//                   }
+//                 }
+//                 let gap = getComputedStyle(container).gap;
+//                 if (!gap || gap === 'normal') {
+//                   gap = '8px';
+//                 }
+//                 host.style.marginLeft = gap;
+//                 host.style.marginRight = '0';
+//               }
+//             } catch (_) {
+//               // Ignore errors during re-initialization
+//             }
+//           },
+//         });
+// //       },
+// //     });
+//     return;
+//   }
+// }
+// 
+//   // Create a wrapper for the button and tooltip
+//   const remembermeButtonWrapper = document.createElement('div');
+//   remembermeButtonWrapper.className = 'mem0-button-wrapper';
+//   remembermeButtonWrapper.style.cssText = `
+//     position: relative;
+//     display: inline-block;
+//   `;
+// 
+//   // Create tooltip element
+//   const tooltip = document.createElement('div');
+//   tooltip.className = 'rememberme-tooltip';
+//   tooltip.style.cssText = `
+//     visibility: hidden;
+//     background-color: #27272A;
+//     color: #fff;
+//     text-align: center;
+//     border-radius: 6px;
+//     padding: 6px 10px;
+//     position: absolute;
+//     z-index: 10000;
+//     bottom: 125%;
+//     left: 50%;
+//     transform: translateX(-50%);
+//     opacity: 0;
+//     transition: opacity 0.3s;
+//     font-size: 12px;
+//     white-space: nowrap;
+//     pointer-events: none;
+//     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+//     border: 1px solid #3B3B3F;
+//   `;
+//   tooltip.textContent = 'Add memories to your prompt';
+// 
+//   // Add tooltip arrow
+//   const tooltipArrow = document.createElement('div');
+//   tooltipArrow.style.cssText = `
+//     content: "";
+//     position: absolute;
+//     top: 100%;
+//     left: 50%;
+//     margin-left: -5px;
+//     border-width: 5px;
+//     border-style: solid;
+//     border-color: #27272A transparent transparent transparent;
+//   `;
+// 
+//   tooltip.appendChild(tooltipArrow);
+//   remembermeButtonWrapper.appendChild(tooltip);
+// 
+//   // Create the mem0 button
+//   const remembermeButton = document.createElement('button');
+//   remembermeButton.className =
+//     'mem0-claude-btn focus-visible:bg-offsetPlus dark:focus-visible:bg-offsetPlusDark hover:bg-offsetPlus text-textOff dark:text-textOffDark hover:text-textMain dark:hover:bg-offsetPlusDark dark:hover:text-textMainDark font-sans focus:outline-none outline-none outline-transparent transition duration-300 ease-out font-sans select-none items-center relative group/button justify-center text-center items-center rounded-lg cursor-pointer active:scale-[0.97] active:duration-150 active:ease-outExpo origin-center whitespace-nowrap inline-flex text-sm h-8 aspect-[9/8]';
+//   remembermeButton.setAttribute('aria-label', 'Mem0 AI');
+//   remembermeButton.setAttribute('type', 'button');
+//   remembermeButton.style.position = 'relative';
+// 
+//   // Create notification dot
+//   const notificationDot = document.createElement('div');
+//   notificationDot.id = 'rememberme-notification-dot';
+//   notificationDot.style.cssText = `
+//     position: absolute;
+//     top: -3px;
+//     right: -3px;
+//     width: 10px;
+//     height: 10px;
+//     background-color: rgb(128, 221, 162);
+//     border-radius: 50%;
+//     border: 2px solid #18181B;
+//     display: none;
+//     z-index: 1001;
+//     pointer-events: none;
+//   `;
+// 
+//   // Add keyframe animation for the dot
+//   if (!document.getElementById('notification-dot-animation')) {
+//     const style = document.createElement('style');
+//     style.id = 'notification-dot-animation';
+//     style.innerHTML = `
+//       @keyframes popIn {
+//         0% { transform: scale(0); }
+//         50% { transform: scale(1.2); }
+//         100% { transform: scale(1); }
+//       }
+//       
+//       #rememberme-notification-dot.active {
+//         display: block !important;
+//         animation: popIn 0.3s ease-out forwards;
+//       }
+//     `;
+//     document.head.appendChild(style);
+//   }
+// 
+//   // Create inner structure similar to other buttons
+//   remembermeButton.innerHTML = `
+//     <div class="flex items-center min-w-0 font-medium gap-1.5 justify-center">
+//       <div class="flex shrink-0 items-center justify-center size-4">
+//         <img src="${chrome.runtime.getURL('icons/rememberme-icon.png')}" alt="Mem0 AI" width="14" height="14" />
+//       </div>
+//     </div>
+//   `;
+// 
+//   // Add the notification dot to the button
+//   remembermeButton.appendChild(notificationDot);
+//   // Try to find the right-side icons container near the submit button and prepend there
+//   let iconsContainer = null;
+//   let modelBtn = null;
+//   try {
+//     // Prefer explicit model button from site config
+//     try {
+//       let cfg =
+//         typeof SITE_CONFIG !== 'undefined' && SITE_CONFIG.perplexity
+//           ? SITE_CONFIG.perplexity
+//           : null;
+//       let modelSel = cfg && cfg.modelButtonSelector;
+//       if (modelSel) {
+//         modelBtn = document.querySelector(modelSel);
+//       }
+//     } catch (_) {
+//       // Ignore errors during re-initialization
+//     }
+// 
+//     // 1) Exact class combo (from screenshot) – Tailwind classes require escaping ':'
+//     iconsContainer = document.querySelector(
+//       'div.bg-raised.dark\\:bg-offset.flex.items-center.justify-self-end.rounded-full'
+//     );
+//     // 2) Slightly relaxed class combo
+//     if (!iconsContainer) {
+//       iconsContainer = document.querySelector('div.bg-raised.flex.items-center.rounded-full');
+//     }
+//     // 3) Attribute-contains selector as a robust fallback
+//     if (!iconsContainer) {
+//       iconsContainer = document.querySelector(
+//         'div[class*="bg-raised"][class*="items-center"][class*="rounded-full"]'
+//       );
+//     }
+//     // 4) Fallback based on Submit button proximity
+//     if (!iconsContainer) {
+//       const submitBtn = document.querySelector('button[aria-label="Submit"]');
+//       if (submitBtn && submitBtn.parentElement) {
+//         const sibling = submitBtn.parentElement.previousElementSibling;
+//         if (sibling && sibling.querySelectorAll('button').length > 0) {
+//           iconsContainer = sibling;
+//         }
+//         if (!iconsContainer) {
+//           const candidates = submitBtn.parentElement.querySelectorAll('div');
+//           for (const c of Array.from(candidates)) {
+//             if (c.querySelectorAll('button').length >= 2) {
+//               iconsContainer = c;
+//               break;
+//             }
+//           }
+//         }
+//       }
+//     }
+//   } catch (_) {
+//     // Ignore errors during re-initialization
+//   }
+// 
+//   // If model button found, insert right after it; else, insert at start of icon group
+//   if (modelBtn && modelBtn.parentElement) {
+//     let container = modelBtn.parentElement;
+//     // If the immediate parent is not a horizontal flex, walk up a few levels to find one
+//     try {
+//       let probe: Element | null = container;
+//       let hops = 0;
+//       while (probe && hops < 5) {
+//         let cs = getComputedStyle(probe);
+//         if (cs.display === 'flex' && cs.flexDirection !== 'column') {
+//           container = probe as HTMLElement;
+//           break;
+//         }
+//         probe = probe.parentElement;
+//         hops++;
+//       }
+//     } catch (_) {
+//       // Ignore errors during re-initialization
+//     }
+//     // Place as the first icon in the group
+//     container.insertBefore(remembermeButtonWrapper, container.firstElementChild);
+//   } else if (iconsContainer) {
+//     iconsContainer.insertBefore(remembermeButtonWrapper, iconsContainer.firstChild);
+//   }
+// 
+//   // Add the button to the wrapper first
+//   remembermeButtonWrapper.appendChild(remembermeButton);
+// 
+//   // Find the input container and insert the button to the LEFT of the input
+//   let inputContainer: HTMLElement | null = null;
+//   const inputEl = getTextarea();
+// 
+//   if (inputEl) {
+//     // Try to find the input container by looking for the parent that contains the input
+//     let currentElement: HTMLElement | null = inputEl as HTMLElement;
+//     while (currentElement && currentElement !== document.body) {
+//       // Look for a container that has flex layout and contains the input
+//       const computedStyle = window.getComputedStyle(currentElement);
+//       if (computedStyle.display === 'flex' && currentElement.contains(inputEl)) {
+//         inputContainer = currentElement;
+//         break;
+//       }
+//       currentElement = currentElement.parentElement;
+//     }
+// 
+//     // Fallback: use the direct parent of the input
+//     if (!inputContainer) {
+//       inputContainer = inputEl.parentElement;
+//     }
+//   }
+// 
+//   if (!inputContainer) {
+//     setTimeout(addRememberMeButton, 500);
+//     return;
+//   }
+// 
+//   // Insert the button as the FIRST child of the input container (leftmost position)
+//   inputContainer.insertBefore(remembermeButtonWrapper, inputContainer.firstChild);
+// 
+//   // Style the button to match the input area
+//   remembermeButton.style.width = '32px';
+//   remembermeButton.style.height = '32px';
+//   remembermeButton.style.borderRadius = '8px';
+//   remembermeButton.style.background = 'transparent';
+//   remembermeButton.style.display = 'inline-flex';
+//   remembermeButton.style.alignItems = 'center';
+//   remembermeButton.style.justifyContent = 'center';
+//   remembermeButton.style.marginRight = '8px';
+//   remembermeButtonWrapper.style.display = 'inline-flex';
+//   remembermeButtonWrapper.style.alignItems = 'center';
+//   remembermeButtonWrapper.style.justifyContent = 'center';
+// 
+//   // Add hover effect for tooltip
+//   remembermeButtonWrapper.addEventListener('mouseenter', () => {
+//     tooltip.style.visibility = 'visible';
+//     tooltip.style.opacity = '1';
+//   });
+// 
+//   remembermeButtonWrapper.addEventListener('mouseleave', () => {
+//     tooltip.style.visibility = 'hidden';
+//     tooltip.style.opacity = '0';
+//   });
+// 
+//   // Add click event listener - modified to check login first and fix empty text case
+//   remembermeButton.addEventListener('click', () => {
+//     // Get the current input text
+//     const textarea = getTextarea();
+// 
+//     if (textarea && getInputText(textarea).trim()) {
+//       // If there's text in the input, process memories
+//       handleRememberMeModal('rememberme-icon-button');
+//     } else {
+//       // If no text, check login status first
+//       chrome.storage.sync.get(
+//         [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
+//         function (items) {
+//           if (!items.apiKey && !items.access_token) {
+//             // Not logged in, show login popup
+//             showLoginPopup();
+//           } else {
+//             // Logged in but no text, show tooltip message
+//             const originalText = tooltip.textContent;
+//             tooltip.textContent = 'Add some text to find memories';
+//             tooltip.style.visibility = 'visible';
+//             tooltip.style.opacity = '1';
+// 
+//             // Reset the tooltip after a delay
+//             setTimeout(() => {
+//               tooltip.textContent = originalText;
+//               if (!remembermeButtonWrapper.matches(':hover')) {
+//                 tooltip.style.visibility = 'hidden';
+//                 tooltip.style.opacity = '0';
+//               }
+//             }, 1500);
+//           }
+//         }
+//       );
+//     }
+//   });
+// 
+//   // Setup the notification dot based on input content
+//   updateNotificationDot();
+}
+
+// Function to update the notification dot based on input content
+function updateNotificationDot() {
+  const textarea = getTextarea();
+  const host = document.getElementById('rememberme-icon-button');
+  if (!textarea || !host) {
+    setTimeout(updateNotificationDot, 500);
+    return;
+  }
+
+  const applyState = () => {
+    const inputText = getInputText(textarea) || '';
+    const hasText = inputText.trim() !== '';
+    try {
+      host.setAttribute('data-has-text', hasText ? '1' : '0');
+    } catch (_) {
+      // Ignore errors during re-initialization
+    }
+  };
+
+  // Observe and listen for changes
+  try {
+    const mo = new MutationObserver(applyState);
+    mo.observe(textarea, { attributes: true, childList: true, characterData: true, subtree: true });
+  } catch (_) {
+    // Ignore errors during re-initialization
+  }
+
+  if (!textarea.dataset.perplexityApplyStateHooked) {
+    textarea.dataset.perplexityApplyStateHooked = 'true';
+    textarea.addEventListener('input', applyState);
+    textarea.addEventListener('keyup', applyState);
+    textarea.addEventListener('focus', applyState);
+  }
+  applyState();
+  setTimeout(applyState, 300);
+}
+
 // Shared function to update the input field with all collected memories
 function updateInputWithMemories() {
   const inputElement = getTextarea();
@@ -2051,14 +2009,14 @@ function updateInputWithMemories() {
 
   // First, remove any existing memory content from the input
   let currentContent = getInputText(inputElement);
-  const memoryMarker = '\n\n' + OPENMEMORY_PROMPTS.memory_marker_prefix;
+  const memoryMarker = '\n\n' + REMEMBERME_PROMPTS.memory_marker_prefix;
 
   if (currentContent.includes(memoryMarker)) {
     currentContent = currentContent.substring(0, currentContent.indexOf(memoryMarker)).trim();
   }
 
   // Create the memory content string
-  let memoriesContent = '\n\n' + OPENMEMORY_PROMPTS.memory_header_text + '\n';
+  let memoriesContent = '\n\n' + REMEMBERME_PROMPTS.memory_header_text + '\n';
 
   // Add all memories to the content
   allMemories.forEach((mem, index) => {
@@ -2083,84 +2041,17 @@ function getMemoryEnabledState(): Promise<boolean> {
 
 // Function to capture and store the current message as a memory
 function captureAndStoreMemory() {
-  // Get the message content
   const textarea = getTextarea();
   if (!textarea) {
     return;
   }
 
-  // Get raw content from the input element
-  let message = getInputText(textarea);
-
+  const message = getInputText(textarea);
   if (!message || message.trim() === '') {
     return;
   }
 
-  // Skip if message contains the memory wrapper
-  if ((message || '').includes('Here is some of my memories to help')) {
-    // Extract only the user's original message
-    const parts = (message || '').split('Here is some of my memories to help');
-    message = (parts[0] || '').trim();
-  }
-
-  // Skip if message is empty after cleaning
-  if (!message || message.trim() === '') {
-    return;
-  }
-
-  // Asynchronously store the memory
-  chrome.storage.sync.get(
-    [
-      StorageKey.API_KEY,
-      StorageKey.USER_ID_CAMEL,
-      StorageKey.ACCESS_TOKEN,
-      StorageKey.MEMORY_ENABLED,
-      StorageKey.SELECTED_ORG,
-      StorageKey.SELECTED_PROJECT,
-      StorageKey.USER_ID,
-    ],
-    function (items) {
-      // Skip if memory is disabled or no credentials
-      if (items.memory_enabled === false || (!items.apiKey && !items.access_token)) {
-        return;
-      }
-
-      const authHeader = items.access_token
-        ? `Bearer ${items.access_token}`
-        : `Token ${items.apiKey}`;
-
-      const userId = items.userId || items.user_id || 'chrome-extension-user';
-
-      const optionalParams: OptionalApiParams = {};
-      if (items.selected_org) {
-        optionalParams.org_id = items.selected_org;
-      }
-      if (items.selected_project) {
-        optionalParams.project_id = items.selected_project;
-      }
-
-      // Send memory to mem0 API asynchronously without waiting for response
-      fetch('https://api.mem0.ai/v1/memories/', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: authHeader,
-        },
-        body: JSON.stringify({
-          messages: [{ role: MessageRole.User, content: message }],
-          user_id: userId,
-          infer: true,
-          metadata: {
-            provider: 'Perplexity',
-          },
-          source: 'OPENMEMORY_CHROME_EXTENSION',
-          ...optionalParams,
-        }),
-      }).catch(error => {
-        console.error('Error saving memory:', error);
-      });
-    }
-  );
+  addMemoryToMem0(message, perplexityConfig);
 }
 
 // Modify the setupSubmitButtonListener function to call captureAndStoreMemory
@@ -2173,12 +2064,12 @@ function setupSubmitButtonListener() {
   }
 
   // Check if we already added a listener
-  if (submitButton.dataset.mem0Listener) {
+  if (submitButton.dataset.remembermeListener) {
     return;
   }
 
   // Mark the button as having our listener
-  submitButton.dataset.mem0Listener = 'true';
+  submitButton.dataset.remembermeListener = 'true';
 
   // Add click event listener to the submit button
   submitButton.addEventListener('click', () => {
@@ -2291,23 +2182,19 @@ async function handleMem0Processing(
   }
 
   // If already processing, don't start another operation
-  if (isProcessingMem0) {
+  if (isProcessingRememberMe) {
     return;
   }
 
-  isProcessingMem0 = true;
+  isProcessingRememberMe = true;
 
   try {
     const data = await new Promise<StorageItems>(resolve => {
       chrome.storage.sync.get(
         [
-          StorageKey.API_KEY,
-          StorageKey.USER_ID_CAMEL,
-          StorageKey.ACCESS_TOKEN,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
           StorageKey.MEMORY_ENABLED,
-          StorageKey.SELECTED_ORG,
-          StorageKey.SELECTED_PROJECT,
-          StorageKey.USER_ID,
           StorageKey.SIMILARITY_THRESHOLD,
           StorageKey.TOP_K,
         ],
@@ -2317,25 +2204,23 @@ async function handleMem0Processing(
       );
     });
 
-    const apiKey = data[StorageKey.API_KEY];
-    const userId = (data[StorageKey.USER_ID_CAMEL] ||
-      data[StorageKey.USER_ID] ||
-      'chrome-extension-user') as string;
-    const accessToken = data[StorageKey.ACCESS_TOKEN];
-    const memoryEnabled = data[StorageKey.MEMORY_ENABLED] !== false; // Default to true if not set
+    const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+    const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+    const memoryEnabled = data[StorageKey.MEMORY_ENABLED] !== false;
 
     const optionalParams: OptionalApiParams = {};
-    if (data[StorageKey.SELECTED_ORG]) {
-      optionalParams.org_id = data[StorageKey.SELECTED_ORG];
+    const orgId = getOrgId();
+    const projectId = getProjectId();
+    if (orgId) {
+      optionalParams.org_id = orgId;
     }
-    if (data[StorageKey.SELECTED_PROJECT]) {
-      optionalParams.project_id = data[StorageKey.SELECTED_PROJECT];
+    if (projectId) {
+      optionalParams.project_id = projectId;
     }
 
-    if (!apiKey && !accessToken) {
-      console.error('No API Key or Access Token found');
-      isProcessingMem0 = false;
-      // Show login popup instead of just returning
+    if (!supabaseAccessToken || !supabaseUserId) {
+      console.error('No Supabase authentication found');
+      isProcessingRememberMe = false;
       showLoginPopup();
       return;
     }
@@ -2345,7 +2230,7 @@ async function handleMem0Processing(
       if (clickSendButton) {
         clickSendButtonWithDelay();
       }
-      isProcessingMem0 = false;
+      isProcessingRememberMe = false;
       return;
     }
 
@@ -2354,11 +2239,16 @@ async function handleMem0Processing(
 
     sendExtensionEvent('modal_clicked', {
       provider: 'perplexity',
-      source: 'OPENMEMORY_CHROME_EXTENSION',
+      source: 'REMEMBERME_CHROME_EXTENSION',
       browser: getBrowser(),
     });
 
-    const authHeader = accessToken ? `Bearer ${accessToken}` : `Token ${apiKey}`;
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      console.error('[Perplexity] VITE_MEM0_API_KEY not configured');
+      return;
+    }
+    const authHeader = `Token ${apiKey}`;
 
     const messages = [{ role: MessageRole.User, content: message }];
 
@@ -2384,12 +2274,12 @@ async function handleMem0Processing(
       },
       body: JSON.stringify({
         messages: messages,
-        user_id: userId,
+        user_id: supabaseUserId,
         infer: true,
-        source: 'OPENMEMORY_CHROME_EXTENSION',
         metadata: {
           provider: 'Perplexity',
         },
+        version: 'v2',
         ...optionalParams,
       }),
     })
@@ -2411,12 +2301,12 @@ async function handleMem0Processing(
     // Close the modal if there was an error
     closeModal();
   } finally {
-    isProcessingMem0 = false;
+    isProcessingRememberMe = false;
   }
 }
 
 // Thin wrapper to trigger memory flow from the UI button
-function handleMem0Modal(sourceButtonId: string | null = null) {
+function handleRememberMeModal(sourceButtonId: string | null = null) {
   try {
     const textarea = getTextarea();
     const captured = textarea ? (getInputText(textarea) || '').trim() : '';
@@ -2451,9 +2341,15 @@ function clickSendButtonWithDelay() {
 }
 
 function initializeMem0Integration() {
+  console.log('[Perplexity] initializeMem0Integration called');
+  
   // First check if memory is enabled
-  getMemoryEnabledState().then(memoryEnabled => {
+  getMemoryEnabledState()
+    .then(memoryEnabled => {
+      console.log('[Perplexity] Memory enabled state:', memoryEnabled);
+      
     if (!memoryEnabled) {
+        console.log('[Perplexity] Memory is disabled, skipping initialization');
       // If memory is disabled, remove any existing button
       const existingButton = document.querySelector('.mem0-button-wrapper');
       if (existingButton) {
@@ -2462,37 +2358,65 @@ function initializeMem0Integration() {
       return;
     }
 
-    setupInputObserver();
-    try {
-      hookPerplexityBackgroundSearchTyping();
-    } catch {
-      // Ignore errors
-    }
+      console.log('[Perplexity] Memory is enabled, proceeding with initialization');
+      setupInputObserver();
+      try {
+        console.log('[Perplexity] Initializing background search hook...');
+        const hookSuccess = hookPerplexityBackgroundSearchTyping();
+        if (hookSuccess) {
+          console.log('[Perplexity] Background search hook initialized successfully');
+        } else {
+          console.log('[Perplexity] Background search hook: input element not found, will retry...');
+        }
+      } catch (error) {
+        console.error('[Perplexity] Failed to initialize background search hook:', error);
+        // Ignore errors
+      }
 
-    // Add the Mem0 button to the UI
-    addMem0Button();
+    // COMMENTED OUT: Icon button injection - using notification-only approach
+    // addRememberMeButton();
 
     // Set up the submit button listener to clear memories
     setupSubmitButtonListener();
 
-    // Add DOM mutation observer to monitor for UI changes
-    const bodyObserver = new MutationObserver(() => {
-      addMem0Button();
-      setupSubmitButtonListener();
-      updateNotificationDot();
-    });
+      // Add DOM mutation observer to monitor for UI changes
+      const bodyObserver = new MutationObserver(() => {
+        // COMMENTED OUT: Icon button injection - using notification-only approach
+        // addRememberMeButton();
+        setupSubmitButtonListener();
+        updateNotificationDot();
+        // Retry background search hook if not already attached
+        let inputElement: HTMLElement | null = null;
+        for (const selector of perplexityConfig.inputSelectors) {
+          inputElement = document.querySelector(selector);
+          if (inputElement) break;
+        }
+        if (inputElement && !(inputElement as any).dataset[perplexityConfig.backgroundSearchHookAttribute]) {
+          hookPerplexityBackgroundSearchTyping();
+        }
+      });
 
     bodyObserver.observe(document.body, {
       childList: true,
       subtree: true,
     });
 
-    // Re-check periodically in case of navigation or UI changes
-    setInterval(() => {
-      addMem0Button();
-      setupSubmitButtonListener();
-      updateNotificationDot();
-    }, 3000);
+      // COMMENTED OUT: Icon button injection - using notification-only approach
+      // Re-check periodically in case of navigation or UI changes
+      setInterval(() => {
+        // addRememberMeButton();
+        setupSubmitButtonListener();
+        updateNotificationDot();
+        // Retry background search hook if not already attached
+        let inputElement: HTMLElement | null = null;
+        for (const selector of perplexityConfig.inputSelectors) {
+          inputElement = document.querySelector(selector);
+          if (inputElement) break;
+        }
+        if (inputElement && !(inputElement as any).dataset[perplexityConfig.backgroundSearchHookAttribute]) {
+          hookPerplexityBackgroundSearchTyping();
+        }
+      }, 3000);
 
     // Set up keyboard shortcut to trigger Mem0 (Ctrl+M)
     document.addEventListener('keydown', function (event: KeyboardEvent) {
@@ -2500,26 +2424,27 @@ function initializeMem0Integration() {
         event.preventDefault();
         const textarea = getTextarea();
         if (textarea && getInputText(textarea).trim()) {
-          handleMem0Modal('mem0-icon-button');
+          handleRememberMeModal('rememberme-icon-button');
         }
       }
     });
+    })
+    .catch((error: Error) => {
+      console.error('[Perplexity] Error checking memory enabled state:', error);
   });
 }
-
-initializeMem0Integration();
 
 // Function to show login popup
 function showLoginPopup() {
   // First remove any existing popups
-  const existingPopup = document.querySelector('#mem0-login-popup');
+  const existingPopup = document.querySelector('#rememberme-login-popup');
   if (existingPopup) {
     existingPopup.remove();
   }
 
   // Create popup container
   const popupOverlay = document.createElement('div');
-  popupOverlay.id = 'mem0-login-popup';
+  popupOverlay.id = 'rememberme-login-popup';
   popupOverlay.style.cssText = `
     position: fixed;
     top: 0;
@@ -2572,7 +2497,7 @@ function showLoginPopup() {
   `;
 
   const logo = document.createElement('img');
-  logo.src = chrome.runtime.getURL('icons/mem0-claude-icon.png');
+  logo.src = chrome.runtime.getURL('icons/rememberme-logo-main.png');
   logo.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2581,7 +2506,7 @@ function showLoginPopup() {
   `;
 
   const logoDark = document.createElement('img');
-  logoDark.src = chrome.runtime.getURL('icons/mem0-icon-black.png');
+  logoDark.src = chrome.runtime.getURL('icons/rememberme-icon.png');
   logoDark.style.cssText = `
     width: 24px;
     height: 24px;
@@ -2590,7 +2515,7 @@ function showLoginPopup() {
   `;
 
   const heading = document.createElement('h2');
-  heading.textContent = 'Sign in to OpenMemory';
+  heading.textContent = 'Sign in to RememberMe';
   heading.style.cssText = `
     margin: 0;
     font-size: 18px;
@@ -2668,12 +2593,13 @@ function showLoginPopup() {
   document.body.appendChild(popupOverlay);
 }
 
-// Global closeModal function to fix the reference error
-function closeModal() {
-  if (memoryModalShown && currentModalOverlay) {
-    document.body.removeChild(currentModalOverlay);
-    memoryModalShown = false;
-    // Reset modal position when closing
-    modalPosition = { top: null, left: null };
-  }
+// Initialize the integration when the page loads
+console.log('[Perplexity] About to call initializeMem0Integration, function exists:', typeof initializeMem0Integration);
+
+try {
+  console.log('[Perplexity] Starting initialization...');
+  initializeMem0Integration();
+} catch (error) {
+  console.error('[Perplexity] Fatal error during initialization:', error);
+  console.error('[Perplexity] Error stack:', (error as Error).stack);
 }

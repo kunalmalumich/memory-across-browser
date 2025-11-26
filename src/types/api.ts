@@ -20,7 +20,7 @@ export type ApiMemoryRequest = {
     page_url?: string;
     engine?: string;
   };
-  source: string;
+  version?: string; // Mem0 API version (v2 recommended)
   org_id?: string;
   project_id?: string;
 };
@@ -35,16 +35,5 @@ export type MemorySearchResponse = Array<{
   categories?: string[];
 }>;
 
-/** User authentication data structure */
-export type LoginData = Partial<{
-  apiKey: string;
-  userId: string;
-  user_id: string;
-  access_token: string;
-}>;
-
-/** Default user ID constant */
-export const DEFAULT_USER_ID = 'chrome-extension-user';
-
 /** Extension source identifier */
-export const SOURCE = 'OPENMEMORY_CHROME_EXTENSION';
+export const SOURCE = 'REMEMBERME_CHROME_EXTENSION';

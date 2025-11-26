@@ -17,7 +17,15 @@ export type Memory = Partial<{
 }>;
 
 /** Search result item from API */
-export type MemorySearchItem = { id: string | number; memory: string; categories?: string[] };
+export type MemorySearchItem = { 
+  id: string | number; 
+  memory: string; 
+  categories?: string[];
+  metadata?: {
+    provider?: string;
+    [key: string]: unknown;
+  };
+};
 
 /** API response wrapper for memories */
 export type MemoriesResponse = Partial<{
@@ -26,7 +34,7 @@ export type MemoriesResponse = Partial<{
 }>;
 
 /** Prompt templates and regex patterns */
-export type OpenMemoryPrompts = {
+export type RememberMePrompts = {
   memory_header_html_strong: string;
   memory_header_plain_regex: RegExp;
   memory_header_html_regex: RegExp;

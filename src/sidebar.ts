@@ -1,30 +1,45 @@
-import { DEFAULT_USER_ID } from './types/api';
 import type { MemoriesResponse, Memory } from './types/memory';
 import { SidebarAction, type SidebarActionMessage } from './types/messages';
 import type { Organization, Project } from './types/organizations';
 import type { SidebarSettings } from './types/settings';
 import { StorageKey } from './types/storage';
-import { getBrowser, sendExtensionEvent } from './utils/util_functions';
+import { getBrowser, sendExtensionEvent, hasValidAuth, getApiKey } from './utils/util_functions';
+
+// Allowed domains for auth callback messages
+const AUTH_CALLBACK_DOMAINS = [
+  '88beefbb-a85b-495b-b4e7-2f1d417e9429-00-3ljhlrdf9fxc.spock.replit.dev',
+  // Add other allowed callback domains here
+];
 
 (function () {
   let sidebarVisible = false;
 
-  function initializeMem0Sidebar(): void {
+  function initializeRememberMeSidebar(): void {
     // Listen for messages from the extension
     chrome.runtime.onMessage.addListener(
-      (request: SidebarActionMessage | { action: SidebarAction.SIDEBAR_SETTINGS }) => {
+      (request: SidebarActionMessage | { action: SidebarAction.SIDEBAR_SETTINGS }, sender, sendResponse) => {
+        console.log('[RememberMe Sidebar] Received message:', {
+          action: request.action,
+          url: window.location.href,
+          hostname: window.location.hostname,
+          sender: sender?.tab?.url || sender?.url,
+        });
+        
         if (request.action === SidebarAction.TOGGLE_SIDEBAR) {
-          chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-            if (data.apiKey || data.access_token) {
+          console.log('[RememberMe Sidebar] TOGGLE_SIDEBAR received on:', window.location.href);
+          hasValidAuth().then(hasAuth => {
+            if (hasAuth) {
+              console.log('[RememberMe Sidebar] Auth check passed, toggling sidebar');
               toggleSidebar();
             } else {
+              console.log('[RememberMe Sidebar] Auth check failed, opening popup');
               chrome.runtime.sendMessage({ action: SidebarAction.OPEN_POPUP });
             }
           });
         }
         if (request.action === SidebarAction.SIDEBAR_SETTINGS) {
-          chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-            if (data[StorageKey.API_KEY] || data[StorageKey.ACCESS_TOKEN]) {
+          hasValidAuth().then(hasAuth => {
+            if (hasAuth) {
               toggleSidebar();
 
               setTimeout(() => {
@@ -39,6 +54,84 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
         return undefined;
       }
     );
+
+    // Listen for postMessage from web-hosted auth callback page
+    window.addEventListener('message', async (event: MessageEvent) => {
+      // Log all incoming messages for debugging
+      if (event.data?.type === 'REMEMBERME_AUTH_CALLBACK') {
+        console.log('[RememberMe Sidebar] Received window message:', {
+          type: event.data.type,
+          origin: event.origin,
+          source: event.source === window ? 'same-window' : 'other',
+          url: window.location.href,
+          hostname: window.location.hostname
+        });
+      }
+      
+      // Only process messages from our auth callback page
+      if (event.data && event.data.type === 'REMEMBERME_AUTH_CALLBACK') {
+        // Verify origin for security
+        try {
+          const originHost = new URL(event.origin).hostname;
+          const isAllowedOrigin = AUTH_CALLBACK_DOMAINS.some(domain => 
+            originHost === domain || originHost.endsWith('.' + domain)
+          );
+          
+          if (!isAllowedOrigin) {
+            console.warn('[RememberMe Sidebar] Rejected message from unauthorized origin:', {
+              origin: event.origin,
+              hostname: originHost,
+              allowedDomains: AUTH_CALLBACK_DOMAINS
+            });
+            return;
+          }
+        } catch (originError) {
+          console.warn('[RememberMe Sidebar] Error parsing origin:', originError);
+          // Continue processing if origin check fails (for development)
+        }
+        
+        console.log('[RememberMe Sidebar] Processing auth callback:', {
+          hasSession: !!event.data.session,
+          hasUser: !!event.data.user,
+          hasTokenHash: !!event.data.tokenHash,
+          authType: event.data.authType || event.data.type
+        });
+        
+        // Forward message to background script
+        try {
+          console.log('[RememberMe Sidebar] Sending to background script...');
+          const response = await chrome.runtime.sendMessage({
+            action: event.data.action || 'SUPABASE_MAGIC_LINK_CALLBACK',
+            session: event.data.session,
+            user: event.data.user,
+            tokenHash: event.data.tokenHash,
+            type: event.data.authType || event.data.type || 'email'
+          });
+
+          console.log('[RememberMe Sidebar] Background response received:', {
+            success: response?.success,
+            error: response?.error
+          });
+
+          // Send response back to web page
+          window.postMessage({
+            type: 'REMEMBERME_AUTH_RESPONSE',
+            success: response?.success || false,
+            error: response?.error
+          }, '*');
+          
+          console.log('[RememberMe Sidebar] Response sent to web page');
+        } catch (error) {
+          console.error('[RememberMe Sidebar] Error forwarding auth callback:', error);
+          // Send error response back to web page
+          window.postMessage({
+            type: 'REMEMBERME_AUTH_RESPONSE',
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          }, '*');
+        }
+      }
+    });
   }
 
   function toggleSidebar(): void {
@@ -46,11 +139,11 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     if (typeof sendExtensionEvent === 'function') {
       sendExtensionEvent('extension_browser_icon_clicked', {
         browser: getBrowser(),
-        source: 'OPENMEMORY_CHROME_EXTENSION',
+        source: 'REMEMBERME_CHROME_EXTENSION',
         tab_url: window.location.href,
       });
     }
-    const sidebar = document.getElementById('mem0-sidebar');
+    const sidebar = document.getElementById('rememberme-sidebar');
     if (sidebar) {
       // If sidebar exists, toggle its visibility
       sidebarVisible = !sidebarVisible;
@@ -87,23 +180,23 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
   }
 
   function handleOutsideClick(event: MouseEvent): void {
-    const sidebar = document.getElementById('mem0-sidebar');
+    const sidebar = document.getElementById('rememberme-sidebar');
     if (
       sidebar &&
       !sidebar.contains(event.target as Node) &&
-      !(event.target as HTMLElement)?.closest?.('.mem0-toggle-btn')
+      !(event.target as HTMLElement)?.closest?.('.rememberme-toggle-btn')
     ) {
       toggleSidebar();
     }
   }
 
   function createSidebar(): void {
-    if (document.getElementById('mem0-sidebar')) {
+    if (document.getElementById('rememberme-sidebar')) {
       return;
     }
 
     const sidebarContainer = document.createElement('div');
-    sidebarContainer.id = 'mem0-sidebar';
+    sidebarContainer.id = 'rememberme-sidebar';
 
     // Create fixed header
     const fixedHeader = document.createElement('div');
@@ -111,8 +204,8 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     fixedHeader.innerHTML = `
         <div class="header">
           <div class="logo-container">
-            <img src=${chrome.runtime.getURL('icons/mem0-claude-icon.png')} class="openmemory-icon" alt="OpenMemory Logo">
-            <span class="openmemory-logo">OpenMemory</span>
+            <img src=${chrome.runtime.getURL('icons/rememberme-logo-main.png')} class="openmemory-icon" alt="RememberMe Logo">
+            <span class="openmemory-logo">RememberMe</span>
           </div>
           <div class="header-buttons">
             <button id="closeBtn" class="close-button" title="Close">
@@ -197,7 +290,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
       <div class="section-header">
         <h2 class="section-title">Memory Suggestions</h2>
         <label class="switch">
-          <input type="checkbox" id="mem0Toggle">
+          <input type="checkbox" id="remembermeToggle">
           <span class="slider"></span>
         </label>
       </div>
@@ -220,49 +313,8 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     `;
     settingsTabContent.appendChild(trackSearchSection);
 
-    // Add user ID input section
-    const userIdSection = document.createElement('div');
-    userIdSection.className = 'section';
-    userIdSection.innerHTML = `
-      <div class="section-header">
-        <h2 class="section-title">User ID</h2>
-        <button id="userDashboardBtn" class="link-button" title="Open Users Dashboard">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-external-link-icon lucide-external-link">
-            <path d="M15 3h6v6"/>
-            <path d="M10 14 21 3"/>
-            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-          </svg>
-        </button>
-      </div>
-      <input type="text" id="userIdInput" class="settings-input" placeholder="Enter your user ID" value="chrome-extension-user">
-    `;
-    settingsTabContent.appendChild(userIdSection);
 
-    // Add organization select section
-    const orgSection = document.createElement('div');
-    orgSection.className = 'section';
-    orgSection.innerHTML = `
-      <div class="section-header">
-        <h2 class="section-title">Organization</h2>
-      </div>
-      <select id="orgSelect" class="settings-select">
-        <option value="">Loading organizations...</option>
-      </select>
-    `;
-    settingsTabContent.appendChild(orgSection);
-
-    // Add project select section
-    const projectSection = document.createElement('div');
-    projectSection.className = 'section';
-    projectSection.innerHTML = `
-      <div class="section-header">
-        <h2 class="section-title">Project</h2>
-      </div>
-      <select id="projectSelect" class="settings-select">
-        <option value="">Select an organization first</option>
-      </select>
-    `;
-    settingsTabContent.appendChild(projectSection);
+    // Organization and Project are now set via environment variables
 
     // Add Auto-Inject toggle section
     const autoInjectSection = document.createElement('div');
@@ -342,16 +394,13 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     chrome.storage.sync.get(
       [
         StorageKey.MEMORY_ENABLED,
-        StorageKey.USER_ID,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
         StorageKey.AUTO_INJECT_ENABLED,
         StorageKey.SIMILARITY_THRESHOLD,
         StorageKey.TOP_K,
         StorageKey.TRACK_SEARCHES,
       ],
       function (result) {
-        const toggleCheckbox = memoryToggleSection.querySelector('#mem0Toggle') as HTMLInputElement;
+        const toggleCheckbox = memoryToggleSection.querySelector('#remembermeToggle') as HTMLInputElement;
         if (toggleCheckbox) {
           toggleCheckbox.checked = result[StorageKey.MEMORY_ENABLED] !== false;
         }
@@ -364,12 +413,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
           trackSearchesCheckbox.checked = result[StorageKey.TRACK_SEARCHES] === true;
         }
 
-        const userIdInput = userIdSection.querySelector('#userIdInput') as HTMLInputElement;
-        // Set saved value or keep default value
-        if (result[StorageKey.USER_ID] && userIdInput) {
-          userIdInput.value = result[StorageKey.USER_ID];
-        }
-        // If no saved value, default is already set in HTML
 
         // Load auto-inject setting (default: enabled)
         const autoInjectCheckbox = autoInjectSection.querySelector(
@@ -410,9 +453,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     setupEventListeners(
       sidebarContainer,
       memoryToggleSection,
-      userIdSection,
-      orgSection,
-      projectSection,
       autoInjectSection,
       thresholdSection,
       topKSection,
@@ -437,8 +477,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     // Add styles
     addStyles();
 
-    // Fetch organizations and memories
-    fetchOrganizations();
+    // Fetch memories
     fetchMemoriesAndCount();
   }
 
@@ -447,9 +486,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     saveText: HTMLElement,
     saveLoader: HTMLElement,
     saveMessage: HTMLElement,
-    userIdSection: HTMLElement,
-    orgSection: HTMLElement,
-    projectSection: HTMLElement,
     memoryToggleSection: HTMLElement,
     autoInjectSection: HTMLElement,
     thresholdSection: HTMLElement,
@@ -463,10 +499,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     saveMessage.style.display = 'none';
 
     // Get all the values
-    const userIdInput = userIdSection.querySelector('#userIdInput') as HTMLInputElement;
-    const orgSelect = orgSection.querySelector('#orgSelect') as HTMLSelectElement;
-    const projectSelect = projectSection.querySelector('#projectSelect') as HTMLSelectElement;
-    const toggleCheckbox = memoryToggleSection.querySelector('#mem0Toggle') as HTMLInputElement;
+    const toggleCheckbox = memoryToggleSection.querySelector('#remembermeToggle') as HTMLInputElement;
     const autoInjectCheckbox = autoInjectSection.querySelector(
       '#autoInjectToggle'
     ) as HTMLInputElement;
@@ -476,11 +509,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
       '#trackSearchesToggle'
     ) as HTMLInputElement;
 
-    const userId = (userIdInput?.value || '').trim();
-    const selectedOrgId = orgSelect?.value || '';
-    const selectedOrgName = orgSelect?.options[orgSelect.selectedIndex]?.text || '';
-    const selectedProjectId = projectSelect?.value || '';
-    const selectedProjectName = projectSelect?.options[projectSelect.selectedIndex]?.text || '';
     const memoryEnabled = Boolean(toggleCheckbox?.checked);
     const autoInjectEnabled = Boolean(autoInjectCheckbox?.checked);
     const similarityThreshold = parseFloat(thresholdSlider?.value || '0.3');
@@ -488,11 +516,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
 
     // Prepare settings object
     const settings: SidebarSettings = {
-      user_id: userId || undefined,
-      selected_org: selectedOrgId || undefined,
-      selected_org_name: selectedOrgName || undefined,
-      selected_project: selectedProjectId || undefined,
-      selected_project_name: selectedProjectName || undefined,
       memory_enabled: memoryEnabled,
       auto_inject_enabled: autoInjectEnabled,
       similarity_threshold: similarityThreshold,
@@ -509,9 +532,11 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
 
     // Save to chrome storage
     chrome.storage.sync.set(settings, function () {
+      // Analytics temporarily disabled - will be replaced with custom analytics later
+      /* COMMENTED OUT - Analytics to Mem0 temporarily disabled
       // Send toggle event to API
-      chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-        const headers = getHeaders(data.apiKey, data.access_token);
+      chrome.storage.sync.get([StorageKey.ACCESS_TOKEN], function (data) {
+        const headers = getHeaders(getApiKey());
         fetch(`https://api.mem0.ai/v1/extension/`, {
           method: 'POST',
           headers: headers,
@@ -523,10 +548,11 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
           console.error('Error sending toggle event:', error);
         });
       });
+      */
 
       // Send message to runtime
       chrome.runtime.sendMessage({
-        action: SidebarAction.TOGGLE_MEM0,
+        action: SidebarAction.TOGGLE_REMEMBERME,
         enabled: memoryEnabled,
       });
 
@@ -553,9 +579,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
   function setupEventListeners(
     sidebarContainer: HTMLElement,
     memoryToggleSection: HTMLElement,
-    userIdSection: HTMLElement,
-    orgSection: HTMLElement,
-    projectSection: HTMLElement,
     autoInjectSection: HTMLElement,
     thresholdSection: HTMLElement,
     topKSection: HTMLElement,
@@ -597,36 +620,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     logoutBtn?.addEventListener('click', logout);
 
     // Toggle functionality is now handled by the save button
-
-    // Organization select (for loading projects only)
-    const orgSelect = orgSection.querySelector('#orgSelect') as HTMLSelectElement;
-    orgSelect?.addEventListener('change', function (this: HTMLSelectElement) {
-      const selectedOrgId = this.value;
-
-      // Reset project selection
-      const projectSelect = projectSection.querySelector('#projectSelect') as HTMLSelectElement;
-      if (projectSelect) {
-        projectSelect.innerHTML = '<option value="">Loading projects...</option>';
-      }
-
-      // Fetch projects for selected org
-      if (selectedOrgId) {
-        fetchProjects(selectedOrgId, projectSelect);
-      } else {
-        if (projectSelect) {
-          projectSelect.innerHTML = '<option value="">Select an organization first</option>';
-        }
-      }
-    });
-
-    // User dashboard link button
-    const userDashboardBtn = userIdSection.querySelector('#userDashboardBtn') as HTMLButtonElement;
-    userDashboardBtn?.addEventListener('click', function () {
-      chrome.runtime.sendMessage({
-        action: SidebarAction.OPEN_DASHBOARD,
-        url: 'https://app.mem0.ai/dashboard/users',
-      });
-    });
+    // Organization and Project are managed via environment variables
 
     // Threshold slider event listener
     const thresholdSlider = thresholdSection.querySelector('#thresholdSlider') as HTMLInputElement;
@@ -664,9 +658,6 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
         saveText,
         saveLoader,
         saveMessage,
-        userIdSection,
-        orgSection,
-        projectSection,
         memoryToggleSection,
         autoInjectSection,
         thresholdSection,
@@ -676,128 +667,23 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     });
   }
 
-  function fetchOrganizations(): void {
-    chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-      if (data.apiKey || data.access_token) {
-        const headers = getHeaders(data.apiKey, data.access_token);
-        fetch('https://api.mem0.ai/api/v1/orgs/organizations/', {
-          method: 'GET',
-          headers: headers,
-        })
-          .then(response => response.json())
-          .then((orgs: Organization[]) => {
-            const orgSelect = document.getElementById('orgSelect') as HTMLSelectElement;
-            if (orgSelect) {
-              orgSelect.innerHTML = '<option value="">Select an organization</option>';
-            }
-
-            orgs.forEach(org => {
-              const option = document.createElement('option');
-              option.value = org.org_id;
-              option.textContent = org.name;
-              orgSelect?.appendChild(option);
-            });
-
-            // Load saved org selection or select first org by default
-            chrome.storage.sync.get([StorageKey.SELECTED_ORG], function (result) {
-              if (result.selected_org) {
-                if (orgSelect) {
-                  orgSelect.value = String(result.selected_org ?? '');
-                }
-                const projectSelectEl = document.getElementById(
-                  'projectSelect'
-                ) as HTMLSelectElement;
-                const orgIdStr =
-                  typeof result.selected_org === 'string'
-                    ? result.selected_org
-                    : String(result.selected_org || '');
-                fetchProjects(orgIdStr, projectSelectEl);
-              } else if (orgs.length > 0) {
-                // Select first org by default (but don't save until user clicks save)
-                const firstOrg = orgs[0];
-                if (orgSelect) {
-                  orgSelect.value = String(firstOrg?.org_id ?? '');
-                }
-                const projectSelectEl = document.getElementById(
-                  'projectSelect'
-                ) as HTMLSelectElement;
-                fetchProjects(String(firstOrg?.org_id ?? ''), projectSelectEl);
-              }
-            });
-          })
-          .catch(error => {
-            console.error('Error fetching organizations:', error);
-            const orgSelect = document.getElementById('orgSelect') as HTMLSelectElement;
-            if (orgSelect) {
-              orgSelect.innerHTML = '<option value="">Error loading organizations</option>';
-            }
-          });
-      }
-    });
-  }
-
-  function fetchProjects(orgId: string, projectSelect: HTMLSelectElement): void {
-    chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-      if (data.apiKey || data.access_token) {
-        const headers = getHeaders(data.apiKey, data.access_token);
-        fetch(`https://api.mem0.ai/api/v1/orgs/organizations/${orgId}/projects/`, {
-          method: 'GET',
-          headers: headers,
-        })
-          .then(response => response.json())
-          .then((projects: Project[]) => {
-            if (!projectSelect) {
-              return;
-            }
-            projectSelect.innerHTML = '<option value="">Select a project</option>';
-
-            projects.forEach(project => {
-              const option = document.createElement('option');
-              option.value = project.project_id;
-              option.textContent = project.name;
-              projectSelect.appendChild(option);
-            });
-
-            // Load saved project selection or select first project by default
-            chrome.storage.sync.get([StorageKey.SELECTED_PROJECT], function (result) {
-              if (!projectSelect) {
-                return;
-              }
-              if (result.selected_project) {
-                projectSelect.value = String(result.selected_project ?? '');
-              } else if (projects.length > 0) {
-                // Select first project by default (but don't save until user clicks save)
-                projectSelect.value = String(projects[0]?.project_id ?? '');
-              }
-            });
-          })
-          .catch(error => {
-            console.error('Error fetching projects:', error);
-            if (projectSelect) {
-              projectSelect.innerHTML = '<option value="">Error loading projects</option>';
-            }
-          });
-      }
-    });
-  }
+  // Organization and Project are now managed via environment variables
 
   function fetchMemoriesAndCount(): void {
     chrome.storage.sync.get(
       [
-        StorageKey.API_KEY,
-        StorageKey.ACCESS_TOKEN,
-        StorageKey.USER_ID,
-        StorageKey.SELECTED_ORG,
-        StorageKey.SELECTED_PROJECT,
+        StorageKey.SUPABASE_ACCESS_TOKEN,
+        StorageKey.SUPABASE_USER_ID,
       ],
       function (data) {
-        if (data.apiKey || data.access_token) {
-          const headers = getHeaders(data.apiKey, data.access_token);
+        const supabaseAccessToken = data[StorageKey.SUPABASE_ACCESS_TOKEN];
+        const supabaseUserId = data[StorageKey.SUPABASE_USER_ID];
+        if (supabaseAccessToken && supabaseUserId) {
+          const headers = getHeaders(getApiKey());
 
           // Build query parameters
           const params = new URLSearchParams();
-          const userId = data.user_id || DEFAULT_USER_ID;
-          params.append('user_id', userId);
+          params.append('user_id', supabaseUserId);
           params.append('page', '1');
           params.append('page_size', '20');
 
@@ -841,15 +727,17 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     }
   }
 
-  function getHeaders(apiKey?: string, accessToken?: string): Record<string, string> {
+  function getHeaders(apiKey?: string): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
-    if (apiKey) {
-      headers['Authorization'] = `Token ${apiKey}`;
-    } else if (accessToken) {
-      headers['Authorization'] = `Bearer ${accessToken}`;
+    
+    if (!apiKey) {
+      console.error('[RememberMe Sidebar] VITE_MEM0_API_KEY not configured');
+      return headers;
     }
+    
+    headers['Authorization'] = `Token ${apiKey}`;
     return headers;
   }
 
@@ -879,7 +767,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
     });
 
     // Add this line to maintain the width of the sidebar
-    const sb = document.getElementById('mem0-sidebar') as HTMLElement;
+    const sb = document.getElementById('rememberme-sidebar') as HTMLElement;
     if (sb) {
       sb.style.width = '400px';
     }
@@ -905,7 +793,7 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
           --success-color: #22c55e;
         }
         
-        #mem0-sidebar {
+        #rememberme-sidebar {
           font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
           position: fixed; 
           top: 60px;
@@ -1556,8 +1444,10 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
   }
 
   function logout() {
-    chrome.storage.sync.get([StorageKey.API_KEY, StorageKey.ACCESS_TOKEN], function (data) {
-      const headers = getHeaders(data.apiKey, data.access_token);
+    // Analytics temporarily disabled - will be replaced with custom analytics later
+    /* COMMENTED OUT - Analytics to Mem0 temporarily disabled
+    chrome.storage.sync.get([StorageKey.ACCESS_TOKEN], function (data) {
+      const headers = getHeaders(getApiKey(), data.access_token);
       fetch('https://api.mem0.ai/v1/extension/', {
         method: 'POST',
         headers: headers,
@@ -1568,10 +1458,17 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
         console.error('Error sending logout event:', error);
       });
     });
+    */
     chrome.storage.sync.remove(
-      [StorageKey.API_KEY, StorageKey.USER_ID_CAMEL, StorageKey.ACCESS_TOKEN],
+      [
+        StorageKey.SUPABASE_USER_ID,
+        StorageKey.SUPABASE_USER_EMAIL,
+        StorageKey.SUPABASE_ACCESS_TOKEN,
+        StorageKey.SUPABASE_REFRESH_TOKEN,
+        StorageKey.SUPABASE_SESSION_EXPIRES_AT,
+      ],
       function () {
-        const sidebar = document.getElementById('mem0-sidebar');
+        const sidebar = document.getElementById('rememberme-sidebar');
         if (sidebar) {
           sidebar.style.right = '-500px';
         }
@@ -1580,11 +1477,14 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
   }
 
   function openDashboard() {
-    chrome.storage.sync.get([StorageKey.USER_ID], function () {
+    chrome.storage.sync.get([StorageKey.SUPABASE_USER_ID], function (data) {
+      const userId = data[StorageKey.SUPABASE_USER_ID];
+      if (userId) {
       chrome.runtime.sendMessage({
         action: SidebarAction.OPEN_DASHBOARD,
         url: `https://app.mem0.ai/dashboard/requests`,
       });
+      }
     });
   }
 
@@ -1673,12 +1573,14 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
         e.stopPropagation();
         const memoryId = this.getAttribute('data-id');
         if (memoryId) {
-          chrome.storage.sync.get([StorageKey.USER_ID], function (data) {
-            const userId = data.user_id || 'chrome-extension-user';
+          chrome.storage.sync.get([StorageKey.SUPABASE_USER_ID], function (data) {
+            const userId = data[StorageKey.SUPABASE_USER_ID];
+            if (userId) {
             chrome.runtime.sendMessage({
               action: SidebarAction.OPEN_DASHBOARD,
               url: `https://app.mem0.ai/dashboard/user/${userId}?memoryId=${memoryId}`,
             });
+            }
           });
         }
       });
@@ -1698,8 +1600,8 @@ import { getBrowser, sendExtensionEvent } from './utils/util_functions';
 
   // Initialize the listener when the script loads
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializeMem0Sidebar);
+    document.addEventListener('DOMContentLoaded', initializeRememberMeSidebar);
   } else {
-    initializeMem0Sidebar();
+    initializeRememberMeSidebar();
   }
 })();

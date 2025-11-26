@@ -160,7 +160,7 @@ function watchSpaNavigation(callback: () => void, intervalMs: number = 500): Sto
 }
 
 /* public API */
-export function createShadowRootHost(className: string = 'mem0-root'): ShadowHost {
+export function createShadowRootHost(className: string = 'rememberme-root'): ShadowHost {
   const host = document.createElement('div');
   host.className = className;
   const shadow = host.attachShadow({ mode: 'open' });
@@ -540,7 +540,7 @@ export function mountResilient(opts: MountResilientOptions): Stopper {
         opts.timeoutMs ?? 2000,
         opts.pollMs ?? 200
       );
-      const { host: h, shadow } = createShadowRootHost('mem0-root');
+      const { host: h, shadow } = createShadowRootHost('rememberme-root');
       host = h;
 
       let unplace: Stopper = () => {
@@ -612,7 +612,7 @@ export function mountOnEditorFocus(opts: MountOnEditorFocusOptions): Stopper {
   const deriveAnchor =
     opts.deriveAnchor ||
     ((editor: Element) => editor.closest('form') || editor.parentElement || null);
-  const guardSelector = opts.existingHostSelector || '#mem0-icon-button, .mem0-root';
+  const guardSelector = opts.existingHostSelector || '#rememberme-icon-button, .rememberme-root';
 
   const handleIntent = (e: Event): void => {
     if (used) {
@@ -646,7 +646,7 @@ export function mountOnEditorFocus(opts: MountOnEditorFocusOptions): Stopper {
           return;
         }
 
-        const { host, shadow } = createShadowRootHost('mem0-root');
+        const { host, shadow } = createShadowRootHost('rememberme-root');
 
         const unplace = applyPlacement({ container: host, anchor, placement });
         const cleanup = (
@@ -696,7 +696,7 @@ export function mountOnEditorFocus(opts: MountOnEditorFocusOptions): Stopper {
 }
 
 /* bundled export for convenience */
-export const OPENMEMORY_UI = {
+export const REMEMBERME_UI = {
   createShadowRootHost,
   findAnchor,
   applyPlacement,
@@ -706,4 +706,4 @@ export const OPENMEMORY_UI = {
   mountOnEditorFocus,
 };
 
-export default OPENMEMORY_UI;
+export default REMEMBERME_UI;
