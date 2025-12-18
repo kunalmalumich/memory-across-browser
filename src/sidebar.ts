@@ -7,7 +7,7 @@ import { getBrowser, sendExtensionEvent, hasValidAuth, getApiKey } from './utils
 
 // Allowed domains for auth callback messages
 const AUTH_CALLBACK_DOMAINS = [
-  '88beefbb-a85b-495b-b4e7-2f1d417e9429-00-3ljhlrdf9fxc.spock.replit.dev',
+  'memorykeeper.replit.app',
   // Add other allowed callback domains here
 ];
 
@@ -249,13 +249,6 @@ const AUTH_CALLBACK_DOMAINS = [
           <p class="total-memories-label">Total Memories</p>
           <h3 class="memory-count loading">Loading...</h3>
         </div>
-        <button id="openDashboardBtn" class="dashboard-button">
-          Open Dashboard
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" class="external-link-icon">
-            <path d="M7 17L17 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M7 7H17V17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </button>
       </div>
     `;
 
@@ -264,6 +257,7 @@ const AUTH_CALLBACK_DOMAINS = [
     memoriesTabContent.className = 'tab-content active';
     memoriesTabContent.id = 'memories-tab';
     memoriesTabContent.appendChild(memoryCountContainer);
+
 
     // Add memories section
     const memoriesSection = document.createElement('div');
@@ -474,6 +468,7 @@ const AUTH_CALLBACK_DOMAINS = [
       event.stopPropagation();
     });
 
+
     // Add styles
     addStyles();
 
@@ -608,12 +603,6 @@ const AUTH_CALLBACK_DOMAINS = [
         document.getElementById(`${targetTab}-tab`)?.classList.add('active');
       });
     });
-
-    // Dashboard button
-    const openDashboardBtn = memoryCountContainer.querySelector(
-      '#openDashboardBtn'
-    ) as HTMLButtonElement;
-    openDashboardBtn?.addEventListener('click', openDashboard);
 
     // Logout button
     const logoutBtn = footerToggle.querySelector('#logoutBtn') as HTMLButtonElement;
@@ -779,18 +768,42 @@ const AUTH_CALLBACK_DOMAINS = [
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         
         :root {
-          --bg-dark: #18181b;
-          --bg-card: #27272a;
-          --bg-button: #3b3b3f;
-          --bg-button-hover: #4b4b4f;
+          /* Background colors - softer, more vibrant dark blue-gray instead of pure black */
+          --bg-dark: #0d1117;
+          --bg-card: #161b22;
+          --bg-button: #21262d;
+          --bg-button-hover: #30363d;
           --text-white: #ffffff;
-          --text-gray: #a1a1aa;
-          --purple: #7a5bf7;
-          --border-color: #27272a;
-          --tag-bg: #3b3b3f;
-          --scrollbar-bg: #18181b;
-          --scrollbar-thumb: #3b3b3f;
-          --success-color: #22c55e;
+          --text-gray: #c9d1d9;
+          --text-muted: #8b949e;
+          /* Primary brand colors - purple-blue-green gradient palette */
+          --purple: #8b5cf6;
+          --purple-light: #a78bfa;
+          --purple-dark: #7c3aed;
+          --blue: #58a6ff;
+          --blue-light: #79c0ff;
+          --teal: #39d0d8;
+          --teal-light: #56d4db;
+          --green: #3fb950;
+          --green-light: #56d364;
+          /* Border and UI colors */
+          --border-color: #30363d;
+          --tag-bg: #21262d;
+          --scrollbar-bg: #0d1117;
+          --scrollbar-thumb: #484f58;
+          --success-color: #3fb950;
+          --error-color: #f85149;
+          --error-color-light: #ff6b6b;
+          /* Gradient glows matching icon colors */
+          --purple-glow: rgba(139, 92, 246, 0.25);
+          --blue-glow: rgba(88, 166, 255, 0.25);
+          --teal-glow: rgba(57, 208, 216, 0.25);
+          --multi-glow: rgba(139, 92, 246, 0.15), rgba(88, 166, 255, 0.15), rgba(57, 208, 216, 0.15);
+          --purple-shadow: rgba(139, 92, 246, 0.15);
+          --multi-shadow: rgba(139, 92, 246, 0.1), rgba(88, 166, 255, 0.1), rgba(57, 208, 216, 0.1);
+          --purple-tint: rgba(139, 92, 246, 0.08);
+          --purple-tint-medium: rgba(139, 92, 246, 0.12);
+          --multi-tint: rgba(139, 92, 246, 0.05), rgba(88, 166, 255, 0.05), rgba(57, 208, 216, 0.05);
         }
         
         #rememberme-sidebar {
@@ -812,7 +825,7 @@ const AUTH_CALLBACK_DOMAINS = [
           z-index: 2147483647;
           transition: right 0.3s ease-in-out;
           overflow: hidden;
-          box-shadow: 0px 4px 20px rgba(0, 0, 0, 0.5);
+          box-shadow: 0px 4px 20px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(139, 92, 246, 0.1);
         }
         
         .fixed-header {
@@ -849,11 +862,14 @@ const AUTH_CALLBACK_DOMAINS = [
         
         .tab-button.active {
           color: var(--text-white);
-          border-bottom-color: var(--purple);
+          border-bottom: 2px solid var(--purple);
+          background: linear-gradient(135deg, rgba(139, 92, 246, 0.1), rgba(88, 166, 255, 0.05));
+          box-shadow: 0 2px 8px var(--purple-shadow), inset 0 -1px 0 rgba(139, 92, 246, 0.2);
         }
         
         .tab-button:hover {
           color: var(--text-white);
+          background: var(--purple-tint);
         }
         
         .tab-content {
@@ -925,7 +941,7 @@ const AUTH_CALLBACK_DOMAINS = [
         }
         
         .close-button:hover {
-          color: var(--text-white);
+          color: var(--blue-light);
         }
         
         /* Custom scrollbar styles */
@@ -965,7 +981,6 @@ const AUTH_CALLBACK_DOMAINS = [
         
         .total-memories-content {
           display: flex;
-          justify-content: space-between;
           align-items: center;
         }
         
@@ -988,31 +1003,6 @@ const AUTH_CALLBACK_DOMAINS = [
         .memory-count.loading {
           color: var(--text-gray);
           font-size: 16px;
-        }
-        
-        .dashboard-button {
-          display: flex;
-          flex-direction: row;
-          align-items: center;
-          padding: 4px 8px;
-          gap: 4px;
-          background: var(--bg-button);
-          background-opacity: 0.5;
-          border-radius: 8px;
-          border: none;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          color: var(--text-white);
-          font-size: 14px;
-        }
-        
-        .dashboard-button:hover {
-          background: var(--bg-button-hover);
-        }
-        
-        .external-link-icon {
-          width: 14px;
-          height: 14px;
         }
         
         .section {
@@ -1082,11 +1072,12 @@ const AUTH_CALLBACK_DOMAINS = [
         }
         
         input:checked + .slider {
-          background-color: var(--purple);
+          background: linear-gradient(135deg, var(--purple), var(--blue), var(--teal));
+          box-shadow: 0 0 12px var(--purple-glow), 0 0 8px var(--blue-glow);
         }
         
         input:focus + .slider {
-          box-shadow: 0 0 1px var(--purple);
+          box-shadow: 0 0 8px var(--purple-glow);
         }
         
         input:checked + .slider:before {
@@ -1106,6 +1097,14 @@ const AUTH_CALLBACK_DOMAINS = [
           display: flex;
           justify-content: space-between;
           align-items: flex-start;
+          border: 1px solid var(--border-color);
+          transition: all 0.2s ease;
+        }
+        
+        .memory-card:hover {
+          border-color: var(--purple);
+          box-shadow: 0 2px 12px var(--purple-shadow), 0 0 4px rgba(88, 166, 255, 0.1);
+          background: linear-gradient(135deg, var(--bg-card), rgba(139, 92, 246, 0.06), rgba(88, 166, 255, 0.03));
         }
         
         .memory-content {
@@ -1155,8 +1154,8 @@ const AUTH_CALLBACK_DOMAINS = [
         }
         
         .memory-action-button:hover {
-          color: var(--text-white);
-          background-color: var(--bg-button);
+          color: var(--blue-light);
+          background: linear-gradient(135deg, rgba(139, 92, 246, 0.12), rgba(88, 166, 255, 0.08));
         }
         
         .memory-action-button.copied {
@@ -1198,22 +1197,26 @@ const AUTH_CALLBACK_DOMAINS = [
           flex-direction: row;
           align-items: center;
           padding: 6px 16px;
-          background: var(--bg-button);
+          background: transparent;
+          border: 1px solid var(--border-color);
           border-radius: 8px;
-          border: none;
           cursor: pointer;
           transition: all 0.2s ease;
-          color: var(--text-white);
+          color: var(--text-gray);
           font-size: 14px;
         }
         
         .logout-button:hover {
-          background: var(--bg-button-hover);
+          background: var(--error-color);
+          border-color: var(--error-color);
+          color: var(--text-white);
         }
         
         .loader {
           border: 2px solid var(--bg-button);
           border-top: 2px solid var(--purple);
+          border-right: 2px solid var(--blue);
+          border-bottom: 2px solid var(--teal);
           border-radius: 50%;
           width: 20px;
           height: 20px;
@@ -1254,7 +1257,8 @@ const AUTH_CALLBACK_DOMAINS = [
         .settings-input:focus, .settings-select:focus {
           outline: none;
           border-color: var(--purple);
-          background: var(--bg-button);
+          background: linear-gradient(135deg, var(--bg-card), rgba(139, 92, 246, 0.08), rgba(88, 166, 255, 0.04));
+          box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15), 0 0 0 1px rgba(88, 166, 255, 0.1);
         }
         
         .settings-input::placeholder {
@@ -1285,30 +1289,33 @@ const AUTH_CALLBACK_DOMAINS = [
         }
         
         .link-button:hover {
-          color: var(--text-white);
-          background: var(--bg-button);
+          color: var(--blue-light);
+          background: linear-gradient(135deg, rgba(139, 92, 246, 0.12), rgba(88, 166, 255, 0.08));
         }
         
         .save-button {
           width: 100%;
           padding: 12px 24px;
-          background: var(--purple);
+          background: linear-gradient(135deg, var(--purple), var(--blue), var(--teal));
           border: none;
           border-radius: 8px;
           color: var(--text-white);
           font-size: 14px;
-          font-weight: 500;
+          font-weight: 600;
           cursor: pointer;
-          transition: background-color 0.2s ease;
+          transition: all 0.2s ease;
           display: flex;
           align-items: center;
           justify-content: center;
           gap: 8px;
           font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          box-shadow: 0 4px 12px var(--purple-shadow), 0 2px 6px rgba(88, 166, 255, 0.15);
         }
         
         .save-button:hover:not(:disabled) {
-          background: #6d4ed6;
+          opacity: 0.95;
+          transform: translateY(-1px);
+          box-shadow: 0 6px 20px var(--purple-glow), 0 4px 12px var(--blue-glow), 0 2px 6px var(--teal-glow);
         }
         
         .save-button:disabled {
@@ -1347,12 +1354,15 @@ const AUTH_CALLBACK_DOMAINS = [
         
         .save-message.error {
           background: rgba(239, 68, 68, 0.1);
-          color: #f87171;
+          color: var(--error-color-light);
           border: 1px solid rgba(239, 68, 68, 0.3);
         }
         
         .threshold-value {
-          color: var(--purple);
+          background: linear-gradient(135deg, var(--purple), var(--blue));
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
           font-weight: 600;
           font-size: 14px;
         }
@@ -1379,20 +1389,20 @@ const AUTH_CALLBACK_DOMAINS = [
           width: 20px;
           height: 20px;
           border-radius: 50%;
-          background: var(--purple);
+          background: linear-gradient(135deg, var(--purple), var(--blue));
           cursor: pointer;
           border: 2px solid var(--bg-dark);
-          box-shadow: 0 0 0 1px var(--purple);
+          box-shadow: 0 0 0 1px var(--purple), 0 0 4px rgba(88, 166, 255, 0.3);
         }
         
         .threshold-slider::-moz-range-thumb {
           width: 20px;
           height: 20px;
           border-radius: 50%;
-          background: var(--purple);
+          background: linear-gradient(135deg, var(--purple), var(--blue));
           cursor: pointer;
           border: 2px solid var(--bg-dark);
-          box-shadow: 0 0 0 1px var(--purple);
+          box-shadow: 0 0 0 1px var(--purple), 0 0 4px rgba(88, 166, 255, 0.3);
         }
         
         .threshold-slider::-webkit-slider-track {
@@ -1415,11 +1425,11 @@ const AUTH_CALLBACK_DOMAINS = [
         }
         
         .threshold-slider:focus::-webkit-slider-thumb {
-          box-shadow: 0 0 0 2px var(--purple);
+          box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2), 0 0 0 1px var(--blue);
         }
         
         .threshold-slider:focus::-moz-range-thumb {
-          box-shadow: 0 0 0 2px var(--purple);
+          box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2), 0 0 0 1px var(--blue);
         }
         
         .slider-labels {
@@ -1476,18 +1486,6 @@ const AUTH_CALLBACK_DOMAINS = [
     );
   }
 
-  function openDashboard() {
-    chrome.storage.sync.get([StorageKey.SUPABASE_USER_ID], function (data) {
-      const userId = data[StorageKey.SUPABASE_USER_ID];
-      if (userId) {
-      chrome.runtime.sendMessage({
-        action: SidebarAction.OPEN_DASHBOARD,
-        url: `https://app.mem0.ai/dashboard/requests`,
-      });
-      }
-    });
-  }
-
   // Add function to display memories
   function displayMemories(memories: Memory[]): void {
     const memoryCardsContainer = document.querySelector('.memory-cards') as HTMLElement;
@@ -1531,9 +1529,6 @@ const AUTH_CALLBACK_DOMAINS = [
           <button class="memory-action-button copy-button" title="Copy Memory" data-content="${encodeURIComponent(memoryContent)}">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-copy"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
           </button>
-          <button class="memory-action-button view-button" title="View Memory" data-id="${memory.id || ''}">
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-eye"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
-          </button>
         </div>
       `;
 
@@ -1564,25 +1559,6 @@ const AUTH_CALLBACK_DOMAINS = [
           .catch(err => {
             console.error('Failed to copy: ', err);
           });
-      });
-    });
-
-    // Add event listener for the view button
-    document.querySelectorAll<HTMLButtonElement>('.view-button').forEach(button => {
-      button.addEventListener('click', function (this: HTMLButtonElement, e) {
-        e.stopPropagation();
-        const memoryId = this.getAttribute('data-id');
-        if (memoryId) {
-          chrome.storage.sync.get([StorageKey.SUPABASE_USER_ID], function (data) {
-            const userId = data[StorageKey.SUPABASE_USER_ID];
-            if (userId) {
-            chrome.runtime.sendMessage({
-              action: SidebarAction.OPEN_DASHBOARD,
-              url: `https://app.mem0.ai/dashboard/user/${userId}?memoryId=${memoryId}`,
-            });
-            }
-          });
-        }
       });
     });
   }

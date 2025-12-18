@@ -13,7 +13,8 @@
     "lint:check": "eslint src --ext .ts,.tsx",
     "format": "prettier --write src/**/*.{ts,html}",
     "format:check": "prettier --check src/**/*.{ts,html}",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "verify-icons": "node scripts/verify-icons.js"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.2.0",

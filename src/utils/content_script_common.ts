@@ -221,13 +221,20 @@ export function addMemoryToMem0(
   contextMessages?: Array<{ role: MessageRole; content: string }>
 ): void {
   if (!message || message.trim() === '') {
+    console.warn(`[${config.logPrefix}] Empty message, skipping save`);
     return;
   }
 
   const cleanMessage = config.getContentWithoutMemories(message);
   if (!cleanMessage || cleanMessage.trim() === '') {
+    console.warn(`[${config.logPrefix}] Message empty after cleaning, skipping save`);
     return;
   }
+
+  console.log(`[${config.logPrefix}] addMemoryToMem0 called:`, {
+    messageLength: cleanMessage.length,
+    contextMessagesCount: contextMessages?.length || 0,
+  });
 
   chrome.storage.sync.get(
     [
@@ -244,6 +251,7 @@ export function addMemoryToMem0(
         !supabaseAccessToken ||
         !supabaseUserId
       ) {
+        console.warn(`[${config.logPrefix}] Cannot save memory - disabled or missing credentials`);
         return;
       }
 
@@ -270,25 +278,48 @@ export function addMemoryToMem0(
         optionalParams.project_id = projectId;
       }
 
+      const payload = {
+        messages: messages,
+        user_id: supabaseUserId,
+        infer: true,
+        metadata: {
+          provider: config.provider,
+        },
+        version: 'v2',
+        ...optionalParams,
+      };
+
+      console.log(`[${config.logPrefix}] Saving memory to API:`, {
+        messageCount: messages.length,
+        userId: supabaseUserId,
+        hasOrgId: !!orgId,
+        hasProjectId: !!projectId,
+      });
+
       fetch('https://api.mem0.ai/v1/memories/', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: authHeader,
         },
-        body: JSON.stringify({
-          messages: messages,
-          user_id: supabaseUserId,
-          infer: true,
-          metadata: {
-            provider: config.provider,
-          },
-          version: 'v2',
-          ...optionalParams,
-        }),
-      }).catch(error => {
-        console.error(`[${config.logPrefix}] Error saving memory:`, error);
-      });
+        body: JSON.stringify(payload),
+      })
+        .then(response => {
+          if (!response.ok) {
+            console.error(`[${config.logPrefix}] Memory save failed:`, {
+              status: response.status,
+              statusText: response.statusText,
+            });
+            return response.text().then(text => {
+              console.error(`[${config.logPrefix}] Error response body:`, text);
+            });
+          }
+          console.log(`[${config.logPrefix}] Memory saved successfully`);
+          return response.json();
+        })
+        .catch(error => {
+          console.error(`[${config.logPrefix}] Error saving memory:`, error);
+        });
     }
   );
 }

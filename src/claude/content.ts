@@ -13,6 +13,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import {
   createPlatformSearchOrchestrator,
@@ -1078,7 +1079,15 @@ function createMemoryModal(
   } else if (memoryItems.length === 0) {
     memoriesCounter.textContent = `No Relevant Memories`;
   } else {
-    memoriesCounter.textContent = `${memoryItems.length} Relevant Memories`;
+    const availableCount = memoryItems.filter(m => !allMemoriesById.has(String(m.id))).length;
+    const alreadyAddedCount = memoryItems.length - availableCount;
+    if (availableCount === 0) {
+      memoriesCounter.textContent = `All ${memoryItems.length} memory${memoryItems.length > 1 ? 'ies' : ''} already added`;
+    } else if (alreadyAddedCount > 0) {
+      memoriesCounter.textContent = `${memoryItems.length} Relevant Memories (${availableCount} available)`;
+    } else {
+      memoriesCounter.textContent = `${memoryItems.length} Relevant Memories`;
+    }
   }
 
   // Calculate max height for memories content based on modal height
@@ -1258,11 +1267,24 @@ function createMemoryModal(
       return;
     }
 
+    // Count available (not yet added) memories
+    const availableMemories = memoryItems.filter(m => !allMemoriesById.has(String(m.id)));
+    const alreadyAddedCount = memoryItems.length - availableMemories.length;
+
     // Reset Add to Prompt button state
     if (addToPromptBtn) {
-      addToPromptBtn.disabled = false;
-      addToPromptBtn.style.opacity = '1';
-      addToPromptBtn.style.cursor = 'pointer';
+      // Disable button if all memories are already added
+      if (availableMemories.length === 0) {
+        addToPromptBtn.disabled = true;
+        addToPromptBtn.style.opacity = '0.5';
+        addToPromptBtn.style.cursor = 'not-allowed';
+        addToPromptBtn.textContent = `All ${memoryItems.length} memory${memoryItems.length > 1 ? 'ies' : ''} already added`;
+      } else {
+        addToPromptBtn.disabled = false;
+        addToPromptBtn.style.opacity = '1';
+        addToPromptBtn.style.cursor = 'pointer';
+        addToPromptBtn.textContent = `Add ${availableMemories.length} Memory${availableMemories.length > 1 ? 'ies' : ''} to Prompt`;
+      }
     }
 
     // Use the dynamically set memoriesPerPage value
@@ -1286,10 +1308,8 @@ function createMemoryModal(
         continue;
       }
 
-      // Skip memories that have been added already
-      if (allMemoriesById.has(String(memory.id))) {
-        continue;
-      }
+      // Check if memory is already added (but still show it)
+      const isAlreadyAdded = allMemoriesById.has(String(memory.id));
 
       // Ensure memory has an ID
       if (!memory.id) {
@@ -1303,7 +1323,7 @@ function createMemoryModal(
         align-items: flex-start;
         justify-content: space-between;
         padding: 12px; 
-        background-color: #27272A;
+        background-color: ${isAlreadyAdded ? '#1a1a1a' : '#27272A'};
         border-radius: 8px;
         cursor: pointer;
         transition: all 0.2s ease;
@@ -1311,13 +1331,15 @@ function createMemoryModal(
         max-height: 72px; 
         overflow: hidden;
         flex-shrink: 0;
+        opacity: ${isAlreadyAdded ? '0.6' : '1'};
+        border: ${isAlreadyAdded ? '1px solid #3a3a3a' : 'none'};
       `;
 
       const memoryText = document.createElement('div');
       memoryText.style.cssText = `
         font-size: 14px;
         line-height: 1.5;
-        color: #D4D4D8;
+        color: ${isAlreadyAdded ? '#8b8b8b' : '#D4D4D8'};
         flex-grow: 1;
         display: -webkit-box;
         -webkit-line-clamp: 2;
@@ -1340,20 +1362,30 @@ function createMemoryModal(
       const addButton = document.createElement('button');
       addButton.style.cssText = `
         border: none;
-        cursor: pointer;
+        cursor: ${isAlreadyAdded ? 'not-allowed' : 'pointer'};
         padding: 4px;
-        background:rgb(66, 66, 69);
-        color:rgb(199, 199, 201);
+        background: ${isAlreadyAdded ? 'rgb(40, 40, 43)' : 'rgb(66, 66, 69)'};
+        color: ${isAlreadyAdded ? 'rgb(100, 100, 103)' : 'rgb(199, 199, 201)'};
         border-radius: 100%;
         transition: all 0.2s ease;
+        opacity: ${isAlreadyAdded ? '0.5' : '1'};
       `;
 
-      addButton.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>`;
+      if (isAlreadyAdded) {
+        addButton.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>`;
+        addButton.title = 'Already added';
+      } else {
+        addButton.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>`;
+        addButton.title = 'Add to prompt';
+      }
 
-      // Add click handler for add button
-      addButton.addEventListener('click', (e: MouseEvent) => {
+      // Add click handler for add button (only if not already added)
+      if (!isAlreadyAdded) {
+        addButton.addEventListener('click', (e: MouseEvent) => {
         e.stopPropagation();
         sendExtensionEvent('memory_injection', {
           provider: 'claude',
@@ -1383,12 +1415,30 @@ function createMemoryModal(
             currentMemoryIndex = Math.max(0, currentMemoryIndex - memoriesPerPage);
           }
 
-          memoriesCounter.textContent = `${memoryItems.length} Relevant Memories`;
+          // Recalculate available memories count
+          const newAvailableCount = memoryItems.filter(m => !allMemoriesById.has(String(m.id))).length;
+          if (newAvailableCount === 0 && memoryItems.length > 0) {
+            memoriesCounter.textContent = `All ${memoryItems.length} memory${memoryItems.length > 1 ? 'ies' : ''} already added`;
+          } else {
+            memoriesCounter.textContent = `${memoryItems.length} Relevant Memories${newAvailableCount < memoryItems.length ? ` (${newAvailableCount} available)` : ''}`;
+          }
           showMemories();
         }
 
         // Don't close the modal, allow adding more memories
       });
+      } else {
+        // If already added, add a disabled click handler to show feedback
+        addButton.addEventListener('click', (e: MouseEvent) => {
+          e.stopPropagation();
+          // Visual feedback that it's already added
+          const originalOpacity = addButton.style.opacity;
+          addButton.style.opacity = '0.8';
+          setTimeout(() => {
+            addButton.style.opacity = originalOpacity;
+          }, 200);
+        });
+      }
 
       // Menu button
       const menuButton = document.createElement('button');
@@ -2322,14 +2372,24 @@ function showPopup(popup: HTMLElement, message: string): void {
 }
 
 function getInputValue(): string | null {
-  const inputElement =
-    document.querySelector('div[contenteditable="true"]') ||
-    document.querySelector('textarea') ||
-    document.querySelector('p[data-placeholder="How can I help you today?"]') ||
-    document.querySelector('p[data-placeholder="Reply to Claude..."]');
+  // Prioritize ProseMirror like captureAndStoreMemory does
+  let inputElement = document.querySelector('div[contenteditable="true"].ProseMirror');
+  
+  if (!inputElement) {
+    inputElement =
+      document.querySelector('div[contenteditable="true"]') ||
+      document.querySelector('textarea') ||
+      document.querySelector('p[data-placeholder="How can I help you today?"]') ||
+      document.querySelector('p[data-placeholder="Reply to Claude..."]');
+  }
 
   if (!inputElement) {
     return null;
+  }
+
+  // For ProseMirror, get textContent
+  if (inputElement.classList.contains('ProseMirror')) {
+    return inputElement.textContent || '';
   }
 
   // For the p element placeholders specifically
@@ -2945,9 +3005,23 @@ function showLoginPopup() {
 }
 
 // Function to capture and store memory asynchronously
+// Track processed messages to avoid duplicates
+const processedMessageHashes = new Set<string>();
+// Track when input clearing captured a message to prevent DOM monitoring duplicate
+let lastInputClearingCaptureTime = 0;
+const INPUT_CLEARING_COOLDOWN_MS = 2000; // 2 second cooldown
+
+function hashMessage(text: string): string {
+  // Simple hash function for message deduplication
+  return text.trim().substring(0, 100).replace(/\s+/g, ' ');
+}
+
 async function captureAndStoreMemory(snapshot: string) {
+  console.log('[Claude] captureAndStoreMemory called with snapshot:', snapshot?.substring(0, 50));
+  
   // Check if extension context is valid
   if (!chrome || !chrome.storage) {
+    console.warn('[Claude] Extension context invalid, cannot capture memory');
     return;
   }
 
@@ -2955,10 +3029,11 @@ async function captureAndStoreMemory(snapshot: string) {
     // Check if memory is enabled
     const memoryEnabled = await getMemoryEnabledState();
     if (memoryEnabled === false) {
+      console.log('[Claude] Memory disabled, skipping capture');
       return; // Don't process memories if disabled
     }
-  } catch (_) {
-    // Ignore error
+  } catch (error) {
+    console.error('[Claude] Error checking memory enabled state:', error);
     return;
   }
 
@@ -2979,6 +3054,7 @@ async function captureAndStoreMemory(snapshot: string) {
     }
 
     if (!inputElement) {
+      console.warn('[Claude] Input element not found, cannot capture memory');
       return;
     }
 
@@ -2995,6 +3071,14 @@ async function captureAndStoreMemory(snapshot: string) {
   }
 
   if (!message || message.trim() === '') {
+    console.log('[Claude] Empty message, skipping capture');
+    return;
+  }
+
+  // Check for duplicates
+  const messageHash = hashMessage(message);
+  if (processedMessageHashes.has(messageHash)) {
+    console.log('[Claude] Duplicate message detected, skipping:', messageHash);
     return;
   }
 
@@ -3005,14 +3089,26 @@ async function captureAndStoreMemory(snapshot: string) {
 
   // Skip if message is empty after processing
   if (!message || message.trim() === '') {
+    console.log('[Claude] Message empty after processing, skipping capture');
     return;
   }
 
-  // Asynchronously store the memory
+  // Mark as processed
+  processedMessageHashes.add(messageHash);
+  // Clean up old hashes periodically (keep last 50)
+  if (processedMessageHashes.size > 50) {
+    const hashesArray = Array.from(processedMessageHashes);
+    processedMessageHashes.clear();
+    hashesArray.slice(-50).forEach(h => processedMessageHashes.add(h));
+  }
 
+  console.log('[Claude] Processing memory capture for message:', message.substring(0, 100));
+
+  // Asynchronously store the memory
   try {
     // Check extension context again before storage access
     if (!chrome || !chrome.storage || !chrome.storage.sync) {
+      console.warn('[Claude] Chrome storage not available');
       return;
     }
     chrome.storage.sync.get(
@@ -3026,27 +3122,39 @@ async function captureAndStoreMemory(snapshot: string) {
         try {
           // @ts-ignore
           if (chrome.runtime && (chrome.runtime as ChromeRuntime).lastError) {
+            console.error('[Claude] Chrome runtime error:', (chrome.runtime as ChromeRuntime).lastError);
             return;
           }
-        } catch {
-          // Ignore errors when checking chrome.runtime.lastError
+        } catch (error) {
+          console.error('[Claude] Error checking chrome.runtime.lastError:', error);
         }
         
         const supabaseAccessToken = items[StorageKey.SUPABASE_ACCESS_TOKEN];
         const supabaseUserId = items[StorageKey.SUPABASE_USER_ID];
         
+        console.log('[Claude] Credentials check:', {
+          memory_enabled: items.memory_enabled,
+          hasToken: !!supabaseAccessToken,
+          hasUserId: !!supabaseUserId,
+        });
+        
         // Skip if memory is disabled or no credentials
         if (items.memory_enabled === false || !supabaseAccessToken || !supabaseUserId) {
+          console.warn('[Claude] Memory capture skipped - disabled or missing credentials');
           return;
         }
 
         // Get recent messages for context using sliding window
         const contextMessages = getConversationContext(false);
+        console.log('[Claude] Saving memory with context:', {
+          messageLength: message.length,
+          contextMessagesCount: contextMessages.length,
+        });
         addMemoryToMem0(message, claudeConfig, contextMessages.map(m => ({ role: m.role, content: m.content })));
       }
     );
-  } catch {
-    // Silent failure for background memory addition
+  } catch (error) {
+    console.error('[Claude] Error in captureAndStoreMemory:', error);
   }
 }
 
@@ -3147,7 +3255,21 @@ function setupEnhancedDOMMonitoring() {
 
   // Enhanced real-time message monitoring with multiple strategies
   function setupRealTimeMessageMonitoring() {
-    const threadSelector = '.flex-1.flex.flex-col.gap-3.px-4.max-w-3xl.mx-auto.w-full';
+    // Multiple thread selector fallbacks
+    const threadSelectors = [
+      '.flex-1.flex.flex-col.gap-3.px-4.max-w-3xl.mx-auto.w-full',
+      '[data-testid="conversation-turn"]',
+      'main',
+      'article',
+    ];
+
+    // Multiple user message selector fallbacks
+    const userMessageSelectors = [
+      '.font-user-message',
+      '[data-author="user"]',
+      '[data-role="user"]',
+      '.user-message',
+    ];
 
     // Strategy 1: Monitor for new user message elements
     const messageObserver = new MutationObserver(mutations => {
@@ -3155,42 +3277,49 @@ function setupEnhancedDOMMonitoring() {
         mutation.addedNodes.forEach(node => {
           if (node.nodeType === 1) {
             const el = node as Element;
-            // Look for user messages
-            const userMessage = el.querySelector('.font-user-message');
-            if (userMessage) {
-              const text = (userMessage.textContent || '').trim();
-              if (text) {
-                // Add to conversation history
-                addToConversationHistory(MessageRole.User, text);
-
-                setTimeout(() => {
-                  captureAndStoreMemory(text);
-                  setTimeout(() => {
-                    allMemories = [];
-                    allMemoriesById.clear();
-                  }, 100);
-                }, 50);
+            
+            // Try multiple selectors for user messages
+            let userMessage: Element | null = null;
+            let userText = '';
+            
+            for (const selector of userMessageSelectors) {
+              userMessage = el.querySelector(selector);
+              if (userMessage) {
+                userText = (userMessage.textContent || '').trim();
+                if (userText) {
+                  break;
+                }
+              }
+              
+              // Also check if the node itself matches
+              if ((el as ExtendedElement).matches && (el as ExtendedElement).matches(selector)) {
+                userText = (el.textContent || '').trim();
+                if (userText) {
+                  userMessage = el;
+                  break;
+                }
               }
             }
-
-            // Also check if the node itself is a user message
-            if (
-              (el as ExtendedElement).classList &&
-              (el as ExtendedElement).classList.contains('font-user-message')
-            ) {
-              const text = (el.textContent || '').trim();
-              if (text) {
-                // Add to conversation history
-                addToConversationHistory(MessageRole.User, text);
-
-                setTimeout(() => {
-                  captureAndStoreMemory(text);
-                  setTimeout(() => {
-                    allMemories = [];
-                    allMemoriesById.clear();
-                  }, 100);
-                }, 50);
+            
+            if (userMessage && userText) {
+              // Skip if input clearing just captured this message (within cooldown period)
+              const timeSinceInputClearing = Date.now() - lastInputClearingCaptureTime;
+              if (timeSinceInputClearing < INPUT_CLEARING_COOLDOWN_MS) {
+                console.log('[Claude] Skipping DOM monitoring - input clearing recently captured');
+                return;
               }
+              
+              console.log('[Claude] Detected user message via DOM monitoring:', userText.substring(0, 50));
+              // Add to conversation history
+              addToConversationHistory(MessageRole.User, userText);
+
+              setTimeout(() => {
+                captureAndStoreMemory(userText);
+                setTimeout(() => {
+                  allMemories = [];
+                  allMemoriesById.clear();
+                }, 100);
+              }, 50);
             }
 
             // Also look for Claude's assistant messages
@@ -3219,8 +3348,16 @@ function setupEnhancedDOMMonitoring() {
       });
     });
 
-    // Find and observe the thread
-    const thread = document.querySelector(threadSelector);
+    // Find and observe the thread using multiple selectors
+    let thread: Element | null = null;
+    for (const selector of threadSelectors) {
+      thread = document.querySelector(selector);
+      if (thread) {
+        console.log('[Claude] Found thread container with selector:', selector);
+        break;
+      }
+    }
+    
     if (thread) {
       messageObserver.observe(thread, {
         childList: true,
@@ -3228,7 +3365,9 @@ function setupEnhancedDOMMonitoring() {
         attributes: false,
         characterData: false,
       });
+      console.log('[Claude] Real-time message monitoring active');
     } else {
+      console.warn('[Claude] Thread container not found, retrying in 1s');
       // Retry finding the thread
       setTimeout(setupRealTimeMessageMonitoring, 1000);
     }
@@ -3246,21 +3385,26 @@ function setupEnhancedDOMMonitoring() {
 
     let lastInputValue = '';
     let inputClearingObserver: MutationObserver | undefined;
+    let inputElement: Element | null = null;
 
     function findAndObserveInput() {
       for (const selector of inputSelectors) {
         const input = document.querySelector(selector);
-        if (input) {
+        if (input && input !== inputElement) {
           // Disconnect any existing observer
           if (inputClearingObserver) {
             inputClearingObserver.disconnect();
           }
 
+          inputElement = input;
           inputClearingObserver = new MutationObserver(() => {
             const currentValue = getInputValue() || '';
 
             // Check if input was cleared (had content, now empty)
             if (lastInputValue.trim() && !currentValue.trim()) {
+              console.log('[Claude] Input cleared detected, capturing memory:', lastInputValue.substring(0, 50));
+              // Track capture time to prevent DOM monitoring duplicate
+              lastInputClearingCaptureTime = Date.now();
               // Add to conversation history
               addToConversationHistory(MessageRole.User, lastInputValue);
 
@@ -3288,6 +3432,7 @@ function setupEnhancedDOMMonitoring() {
             lastInputValue = getInputValue() || '';
           });
 
+          console.log('[Claude] Input clearing monitor attached to:', selector);
           break;
         }
       }
@@ -3295,13 +3440,23 @@ function setupEnhancedDOMMonitoring() {
 
     findAndObserveInput();
 
-    // Re-find input periodically in case DOM changes
-    setInterval(findAndObserveInput, 5000);
+    // Re-find input periodically in case DOM changes (only if not already attached)
+    setInterval(() => {
+      if (!inputElement || !document.contains(inputElement)) {
+        inputElement = null;
+        findAndObserveInput();
+      }
+    }, 5000);
   }
 
   // Start all monitoring strategies
   setupRealTimeMessageMonitoring();
   setupInputClearingMonitor();
+  
+  // Check auth on page load (with delay to not interfere)
+  setTimeout(() => {
+    checkAuthOnPageLoad();
+  }, 1000);
 }
 
 // CSP blocks script injection, so focus on content script level approaches
@@ -3362,6 +3517,11 @@ function detectNavigation() {
 
       // Update notification dot
       updateNotificationDot();
+      
+      // Check auth after navigation
+      setTimeout(() => {
+        checkAuthOnPageLoad();
+      }, 1000);
     }, 500); // Small delay to let DOM update
   }
 }

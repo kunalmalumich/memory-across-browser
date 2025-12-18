@@ -12,6 +12,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import {
   createPlatformSearchOrchestrator,
@@ -55,6 +56,214 @@ let elementDetectionInterval: number | null = null;
 let lastFoundTextarea: HTMLElement | null = null;
 let lastFoundSendButton: HTMLButtonElement | null = null;
 
+// Function to get the last N messages from the conversation
+function getLastMessages(count: number): Array<{ role: MessageRole; content: string }> {
+  const messages: Array<{ role: MessageRole; content: string }> = [];
+  
+  // Try multiple selectors to find conversation container
+  const conversationSelectors = [
+    '[data-conversation-id]',
+    '.conversation-container',
+    'main',
+    '[role="main"]',
+    '.chat-container',
+  ];
+  
+  let conversationContainer: Element | null = null;
+  for (const selector of conversationSelectors) {
+    conversationContainer = document.querySelector(selector);
+    if (conversationContainer) break;
+  }
+  
+  // If no container found, try to find message elements directly
+  if (!conversationContainer) {
+    // Look for user and assistant messages directly
+    const userMessages = document.querySelectorAll('[data-message-author-role="user"], [data-role="user"], .user-message, .message.user');
+    const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"], [data-role="assistant"], .assistant-message, .message.assistant');
+    
+    const allMessages: Array<{ element: Element; role: MessageRole; order: number }> = [];
+    
+    userMessages.forEach((el, idx) => {
+      allMessages.push({ element: el, role: MessageRole.User, order: idx });
+    });
+    
+    assistantMessages.forEach((el, idx) => {
+      allMessages.push({ element: el, role: MessageRole.Assistant, order: idx });
+    });
+    
+    // Sort by DOM order (approximate)
+    allMessages.sort((a, b) => {
+      const posA = Array.from(document.body.querySelectorAll('*')).indexOf(a.element as HTMLElement);
+      const posB = Array.from(document.body.querySelectorAll('*')).indexOf(b.element as HTMLElement);
+      return posA - posB;
+    });
+    
+    // Get last N messages
+    const lastMessages = allMessages.slice(-count);
+    
+    for (const msg of lastMessages) {
+      const content = msg.element.textContent?.trim() || '';
+      if (content) {
+        messages.push({ role: msg.role, content });
+      }
+    }
+    
+    return messages;
+  }
+  
+  // Extract messages from container
+  const messageElements = Array.from(conversationContainer.children).reverse();
+  
+  for (const element of messageElements) {
+    if (messages.length >= count) {
+      break;
+    }
+    
+    // Try multiple selectors for user messages
+    const userElement = 
+      element.querySelector('[data-message-author-role="user"]') ||
+      element.querySelector('[data-role="user"]') ||
+      element.querySelector('.user-message') ||
+      element.querySelector('.message.user') ||
+      (element.classList.contains('user-message') || element.classList.contains('user') ? element : null);
+    
+    // Try multiple selectors for assistant messages
+    const assistantElement = 
+      element.querySelector('[data-message-author-role="assistant"]') ||
+      element.querySelector('[data-role="assistant"]') ||
+      element.querySelector('.assistant-message') ||
+      element.querySelector('.message.assistant') ||
+      (element.classList.contains('assistant-message') || element.classList.contains('assistant') ? element : null);
+    
+    if (userElement) {
+      const content = userElement.textContent?.trim() || 
+                     userElement.querySelector('.message-content')?.textContent?.trim() ||
+                     userElement.querySelector('.text-content')?.textContent?.trim() || '';
+      if (content) {
+        messages.unshift({ role: MessageRole.User, content });
+      }
+    } else if (assistantElement) {
+      const content = assistantElement.textContent?.trim() || 
+                     assistantElement.querySelector('.message-content')?.textContent?.trim() ||
+                     assistantElement.querySelector('.text-content')?.textContent?.trim() ||
+                     assistantElement.querySelector('.markdown')?.textContent?.trim() || '';
+      if (content) {
+        messages.unshift({ role: MessageRole.Assistant, content });
+      }
+    }
+  }
+  
+  return messages;
+}
+
+// Auto-sync functions
+function getConversationIdFromUrl(url: string): string | null {
+  const match = url.match(/\/app\/([a-z0-9]+)/);
+  return match?.[1] || null;
+}
+
+function extractAllUserMessages(): Array<{ role: MessageRole; content: string }> {
+  const messages: Array<{ role: MessageRole; content: string }> = [];
+  const userMessages = document.querySelectorAll('[data-message-author-role="user"], [data-role="user"], .user-message, .message.user');
+  
+  userMessages.forEach((element) => {
+    const content = element.textContent?.trim() || 
+                   element.querySelector('.message-content')?.textContent?.trim() ||
+                   element.querySelector('.text-content')?.textContent?.trim() || '';
+    if (content) {
+      messages.push({ role: MessageRole.User, content });
+    }
+  });
+  
+  return messages;
+}
+
+async function isConversationSynced(conversationId: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['gemini_synced_conversations'], (result) => {
+      const synced = new Set(result.gemini_synced_conversations || []);
+      resolve(synced.has(conversationId));
+    });
+  });
+}
+
+async function markConversationSynced(conversationId: string): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['gemini_synced_conversations'], (result) => {
+      const synced = new Set(result.gemini_synced_conversations || []);
+      synced.add(conversationId);
+      chrome.storage.local.set({ gemini_synced_conversations: Array.from(synced) }, resolve);
+    });
+  });
+}
+
+function sendMemoriesToMem0(memories: Array<{ role: MessageRole; content: string }>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    chrome.storage.sync.get([StorageKey.SUPABASE_ACCESS_TOKEN, StorageKey.SUPABASE_USER_ID], (items) => {
+      const supabaseAccessToken = items[StorageKey.SUPABASE_ACCESS_TOKEN];
+      const supabaseUserId = items[StorageKey.SUPABASE_USER_ID];
+      
+      if (!supabaseAccessToken || !supabaseUserId) {
+        reject('Supabase authentication required');
+        return;
+      }
+
+      const optionalParams: OptionalApiParams = {};
+      const orgId = getOrgId();
+      const projectId = getProjectId();
+      if (orgId) optionalParams.org_id = orgId;
+      if (projectId) optionalParams.project_id = projectId;
+
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        reject('VITE_MEM0_API_KEY not configured');
+        return;
+      }
+
+      fetch('https://api.mem0.ai/v1/memories/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Token ${apiKey}`,
+        },
+        body: JSON.stringify({
+          messages: memories,
+          user_id: supabaseUserId,
+          infer: true,
+          metadata: { provider: 'Gemini' },
+          version: 'v2',
+          ...optionalParams,
+        }),
+      })
+        .then(response => response.ok ? resolve() : reject(`Failed: ${response.status}`))
+        .catch(error => reject(`Error: ${error}`));
+    });
+  });
+}
+
+async function autoSyncConversation(conversationId: string): Promise<void> {
+  if (!(await getMemoryEnabledState())) return;
+  if (await isConversationSynced(conversationId)) return;
+
+  const retryDelays = [2000, 3000, 5000];
+  for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, retryDelays[attempt]));
+    const messages = extractAllUserMessages();
+    
+    if (messages.length > 0) {
+      try {
+        await sendMemoriesToMem0(messages);
+        await markConversationSynced(conversationId);
+        console.log(`[Gemini Auto-Sync] ✅ Synced ${messages.length} messages from ${conversationId}`);
+        return;
+      } catch (error) {
+        console.error('[Gemini Auto-Sync] ❌ Error:', error);
+        return;
+      }
+    }
+  }
+}
+
 // Platform configuration
 const geminiConfig: PlatformConfig = {
   provider: 'Gemini',
@@ -81,6 +290,7 @@ const geminiConfig: PlatformConfig = {
   onMemoryModalShown: (shown) => {
     memoryModalShown = shown;
   },
+  getLastMessages: getLastMessages,
   logPrefix: 'Gemini',
 };
 
@@ -2278,10 +2488,31 @@ function initializeMem0Integration(): void {
 
     // **PERFORMANCE FIX: Mark as initialized**
     isInitialized = true;
+    
+    // Check auth on page load
+    setTimeout(() => {
+      checkAuthOnPageLoad();
+    }, 1000);
   } catch {
     // Ignore errors
   }
 }
+
+// Auto-sync on page load and navigation
+let geminiCurrentUrl = window.location.href;
+setTimeout(() => {
+  const conversationId = getConversationIdFromUrl(window.location.href);
+  if (conversationId) autoSyncConversation(conversationId);
+}, 2000);
+
+setInterval(() => {
+  const newUrl = window.location.href;
+  if (newUrl !== geminiCurrentUrl) {
+    geminiCurrentUrl = newUrl;
+    const conversationId = getConversationIdFromUrl(newUrl);
+    if (conversationId) autoSyncConversation(conversationId);
+  }
+}, 1000);
 
 // **PERFORMANCE FIX: Add cleanup function**
 function cleanup(): void {

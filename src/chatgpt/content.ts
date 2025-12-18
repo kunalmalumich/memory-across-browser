@@ -13,6 +13,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import { REMEMBERME_UI } from '../utils/util_positioning';
 import {
@@ -1923,6 +1924,198 @@ function addSyncButton(): void {
   }
 }
 
+/**
+ * Extract conversation ID from ChatGPT URL
+ */
+function getConversationIdFromUrl(url: string): string | null {
+  const match = url.match(/\/c\/([a-f0-9-]+)/);
+  const conversationId = match && match[1] ? match[1] : null;
+  
+  if (conversationId) {
+    console.log('[ChatGPT Auto-Sync] Extracted conversation ID from URL:', conversationId);
+  } else {
+    console.log('[ChatGPT Auto-Sync] No conversation ID found in URL:', url);
+  }
+  
+  return conversationId;
+}
+
+/**
+ * Extract only user messages from currently open conversation
+ * We only extract user messages because RememberMe is designed to remember things about the user,
+ * not ChatGPT's responses (which are AI-generated content, not user information)
+ */
+function extractCurrentConversationMessages(): Array<{ role: MessageRole; content: string }> {
+  console.log('[ChatGPT Auto-Sync] Starting user message extraction...');
+  const messages: Array<{ role: MessageRole; content: string }> = [];
+  
+  // Direct search for user messages only (most reliable approach)
+  const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+  
+  if (userMessages.length === 0) {
+    console.warn('[ChatGPT Auto-Sync] No user messages found');
+    console.log('[ChatGPT Auto-Sync] Debug info:', {
+      url: window.location.href,
+      hasUserMessages: document.querySelectorAll('[data-message-author-role="user"]').length,
+      hasAnyMessages: document.querySelectorAll('[data-message-author-role]').length,
+      mainExists: !!document.querySelector('main')
+    });
+    return messages;
+  }
+  
+  console.log(`[ChatGPT Auto-Sync] Found ${userMessages.length} user messages`);
+  
+  userMessages.forEach((element, index) => {
+    // Try multiple content selectors for robustness
+    const content = element.querySelector('.whitespace-pre-wrap')?.textContent?.trim() || 
+                   element.textContent?.trim() || '';
+    
+    if (content) {
+      messages.push({ role: MessageRole.User, content });
+    } else {
+      console.warn(`[ChatGPT Auto-Sync] User message ${index} has empty content`);
+    }
+  });
+  
+  console.log(`[ChatGPT Auto-Sync] Extracted ${messages.length} user messages`);
+  return messages;
+}
+
+/**
+ * Check if conversation is already synced
+ */
+async function isConversationSynced(conversationId: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['chatgpt_synced_conversations'], (result) => {
+      const synced = new Set(result.chatgpt_synced_conversations || []);
+      const isSynced = synced.has(conversationId);
+      
+      console.log('[ChatGPT Auto-Sync] Checking sync status:', {
+        conversationId,
+        isSynced,
+        totalSyncedConversations: synced.size,
+        syncedIds: Array.from(synced)
+      });
+      
+      resolve(isSynced);
+    });
+  });
+}
+
+/**
+ * Mark conversation as synced
+ */
+async function markConversationSynced(conversationId: string): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['chatgpt_synced_conversations'], (result) => {
+      const synced = new Set(result.chatgpt_synced_conversations || []);
+      const beforeCount = synced.size;
+      synced.add(conversationId);
+      const afterCount = synced.size;
+      
+      chrome.storage.local.set({ 
+        chatgpt_synced_conversations: Array.from(synced) 
+      }, () => {
+        console.log('[ChatGPT Auto-Sync] Marked conversation as synced:', {
+          conversationId,
+          beforeCount,
+          afterCount,
+          wasNew: afterCount > beforeCount
+        });
+        resolve();
+      });
+    });
+  });
+}
+
+/**
+ * Auto-sync conversation on navigation
+ */
+async function autoSyncConversation(conversationId: string): Promise<void> {
+  console.log('[ChatGPT Auto-Sync] Starting auto-sync for conversation:', conversationId);
+  
+  const memoryEnabled = await getMemoryEnabledState();
+  if (!memoryEnabled) {
+    console.log('[ChatGPT Auto-Sync] Memory is disabled, skipping sync');
+    return;
+  }
+  
+  console.log('[ChatGPT Auto-Sync] Memory is enabled, checking sync status...');
+  const alreadySynced = await isConversationSynced(conversationId);
+  if (alreadySynced) {
+    console.log(`[ChatGPT Auto-Sync] Conversation ${conversationId} already synced, skipping`);
+    return;
+  }
+  
+  console.log('[ChatGPT Auto-Sync] Conversation not synced yet, waiting for DOM to load...');
+  
+  // Retry logic: Try multiple times with increasing delays
+  const maxRetries = 3;
+  const retryDelays = [2000, 3000, 5000]; // 2s, 3s, 5s
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, retryDelays[attempt]));
+    
+    console.log(`[ChatGPT Auto-Sync] Attempt ${attempt + 1}/${maxRetries}: Extracting messages...`);
+    const messages = extractCurrentConversationMessages();
+    
+    if (messages.length > 0) {
+      console.log(`[ChatGPT Auto-Sync] Successfully found ${messages.length} messages on attempt ${attempt + 1}`);
+      
+      // Continue with sync process
+      console.log('[ChatGPT Auto-Sync] Checking for authentication credentials...');
+      const items = await new Promise<any>((resolve) => {
+        chrome.storage.sync.get([
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_USER_ID,
+        ], resolve);
+      });
+      
+      const hasToken = !!items[StorageKey.SUPABASE_ACCESS_TOKEN];
+      const hasUserId = !!items[StorageKey.SUPABASE_USER_ID];
+      
+      console.log('[ChatGPT Auto-Sync] Credentials check:', {
+        hasToken,
+        hasUserId,
+        userId: hasUserId ? items[StorageKey.SUPABASE_USER_ID] : 'missing'
+      });
+      
+      if (!hasToken || !hasUserId) {
+        console.warn('[ChatGPT Auto-Sync] Missing credentials, cannot sync. Token:', hasToken, 'UserId:', hasUserId);
+        return;
+      }
+      
+      console.log('[ChatGPT Auto-Sync] Sending messages to Mem0 API...');
+      try {
+        await sendMemoriesToMem0(messages);
+        console.log('[ChatGPT Auto-Sync] Successfully sent messages to Mem0');
+        
+        await markConversationSynced(conversationId);
+        console.log(`[ChatGPT Auto-Sync] ✅ Successfully auto-synced ${messages.length} messages from conversation ${conversationId}`);
+        return;
+      } catch (error) {
+        console.error('[ChatGPT Auto-Sync] ❌ Error during sync:', {
+          error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          conversationId,
+          messageCount: messages.length
+        });
+        return;
+      }
+    }
+    
+    if (attempt < maxRetries - 1) {
+      const nextDelay = retryDelays[attempt + 1] ?? 0;
+      if (nextDelay > 0) {
+        console.log(`[ChatGPT Auto-Sync] No messages found, retrying in ${nextDelay / 1000}s...`);
+      }
+    }
+  }
+  
+  console.warn('[ChatGPT Auto-Sync] No messages found after all retries, conversation may be empty or DOM structure changed');
+}
+
+
 function handleSyncClick(): void {
   getMemoryEnabledState().then(memoryEnabled => {
     if (!memoryEnabled) {
@@ -1980,29 +2173,37 @@ function handleSyncClick(): void {
         }
       });
 
-      sendMemoriesToMem0(memories)
-        .then(() => {
-          if (syncButton) {
-            showSyncPopup(syncButton, `${memories.length} memories synced`);
-          }
-          setSyncButtonLoadingState(false);
-          // Open the modal with memories after syncing
-          handleRememberMeModal('sync-button');
-        })
-        .catch(error => {
-          console.error('Error syncing memories:', error);
-          if (syncButton) {
-            showSyncPopup(syncButton, 'Error syncing memories');
-          }
-          setSyncButtonLoadingState(false);
-          // Open the modal even if there was an error
-          handleRememberMeModal('sync-button');
-        });
+      if (memories.length > 0) {
+        sendMemoriesToMem0(memories)
+          .then(() => {
+            if (syncButton) {
+              showSyncPopup(syncButton, `${memories.length} memories synced`);
+            }
+            setSyncButtonLoadingState(false);
+            // Open the modal with memories after syncing
+            handleRememberMeModal('sync-button');
+          })
+          .catch(error => {
+            console.error('Error syncing memories:', error);
+            if (syncButton) {
+              showSyncPopup(syncButton, 'Error syncing memories');
+            }
+            setSyncButtonLoadingState(false);
+            // Open the modal even if there was an error
+            handleRememberMeModal('sync-button');
+          });
+      } else {
+        if (syncButton) {
+          showSyncPopup(syncButton, 'No memories to sync');
+        }
+        setSyncButtonLoadingState(false);
+      }
     } else {
       console.error('Table or Sync button not found');
     }
   });
 }
+
 
 // New function to send memories in batch
 function sendMemoriesToMem0(memories: Array<{ role: string; content: string }>): Promise<void> {
@@ -2212,6 +2413,11 @@ function initializeMem0Integration(): void {
     // (async () => await updateNotificationDot())();
     hookBackgroundSearchTyping();
     setupAutoInjectPrefetch();
+    
+    // Check auth on page load
+    setTimeout(() => {
+      checkAuthOnPageLoad();
+    }, 1000);
   });
 
   document.addEventListener('keydown', function (event) {
@@ -2426,10 +2632,26 @@ function showLoginPopup() {
   document.body.appendChild(popupOverlay);
 }
 
+
 initializeMem0Integration();
 // --- SPA navigation handling and extension context guard (mirrors Claude) ---
 let chatgptExtensionContextValid = true;
 let chatgptCurrentUrl = window.location.href;
+
+// Check current conversation on initial page load (not just on navigation)
+setTimeout(() => {
+  const conversationId = getConversationIdFromUrl(window.location.href);
+  if (conversationId) {
+    console.log('[ChatGPT Auto-Sync] Initial page load detected, checking conversation:', conversationId);
+    autoSyncConversation(conversationId).catch(error => {
+      console.error('[ChatGPT Auto-Sync] ❌ Error in initial auto-sync:', {
+        error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        conversationId
+      });
+    });
+  }
+}, 2000); // Wait 2 seconds for ChatGPT to load
 
 function chatgptCheckExtensionContext() {
   try {
@@ -2450,17 +2672,40 @@ function chatgptCheckExtensionContext() {
 function chatgptDetectNavigation() {
   const newUrl = window.location.href;
   if (newUrl !== chatgptCurrentUrl) {
+    console.log('[ChatGPT Auto-Sync] Navigation detected:', {
+      from: chatgptCurrentUrl,
+      to: newUrl
+    });
+    
     chatgptCurrentUrl = newUrl;
+
+    const conversationId = getConversationIdFromUrl(newUrl);
 
     // Re-initialize UI after small delay for DOM to settle
     setTimeout(() => {
       try {
-        addSyncButton();
-        // (async () => await addRememberMeIconButton())();
         addSendButtonListener();
-        // (async () => await updateNotificationDot())();
-      } catch {
-        // Ignore errors when setting contenteditable
+        
+        // Auto-sync conversation if we're on a conversation page
+        if (conversationId) {
+          console.log('[ChatGPT Auto-Sync] Conversation ID found, initiating auto-sync...');
+          autoSyncConversation(conversationId).catch(error => {
+            console.error('[ChatGPT Auto-Sync] ❌ Error in auto-sync:', {
+              error,
+              errorMessage: error instanceof Error ? error.message : String(error),
+              conversationId
+            });
+          });
+        } else {
+          console.log('[ChatGPT Auto-Sync] No conversation ID found, not a conversation page');
+        }
+        
+        // Check auth after navigation
+        setTimeout(() => {
+          checkAuthOnPageLoad();
+        }, 1000);
+      } catch (error) {
+        console.error('[ChatGPT Auto-Sync] Error during navigation setup:', error);
       }
     }, 300);
   }

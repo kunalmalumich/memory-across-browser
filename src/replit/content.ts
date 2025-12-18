@@ -18,6 +18,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
@@ -704,6 +705,11 @@ try {
       }
 
       isInitialized = true;
+
+      // Check auth on page load
+      setTimeout(() => {
+        checkAuthOnPageLoad();
+      }, 1000);
 
       setupInputObserver();
       try {

@@ -1,4 +1,5 @@
 import { StorageKey, type StorageData } from '../types/storage';
+import { SidebarAction } from '../types/messages';
 import { isSupabaseAuthenticated, getSupabaseAccessToken } from './auth';
 
 /**
@@ -160,6 +161,16 @@ export const getBrowser = (): BrowserType => {
 export const shouldTriggerMemorySearch = (text: string): boolean => {
   const normalized = text.trim();
   
+  // Skip if text contains memory header (programmatic injection, not user typing)
+  // Check for both plain text and HTML variants of memory header
+  if (
+    normalized.includes("Here is some of my memories to help answer better") ||
+    normalized.includes("rememberme-wrapper") ||
+    normalized.includes("data-rememberme-idx")
+  ) {
+    return false;
+  }
+  
   // Minimum requirements
   if (normalized.length < 5 || !/[a-zA-Z]/.test(normalized)) {
     return false;
@@ -211,18 +222,39 @@ export const showMemoryNotification = (
   query?: string,
   onOpenModal?: () => void
 ): void => {
+  // Check if sidebar is open - don't show notification if it is
+  const sidebar = document.getElementById('rememberme-sidebar');
+  if (sidebar) {
+    const computedStyle = window.getComputedStyle(sidebar);
+    const rightValue = computedStyle.right;
+    // Sidebar is visible when right is '0px' (visible) vs '-600px' (hidden)
+    // Also check if element is actually in the DOM and visible
+    if (rightValue === '0px' || (rightValue !== '-600px' && sidebar.offsetParent !== null)) {
+      return; // Sidebar is open, skip notification
+    }
+  }
+  
   // Remove existing notification if present
   const existing = document.querySelector('.rememberme-auto-notification');
   if (existing) {
     existing.remove();
   }
   
+  // Check if this is a login notification (count === -1)
+  const isLoginNotification = count === -1;
+  
   // Determine if memories were found
   const hasMemories = count > 0;
-  const iconPath = hasMemories 
-    ? 'icons/RememberMe_Search_Information_Icon.png'
-    : 'icons/RememberMe_Data_Shield_M_Icon.png';
-  const bgColor = hasMemories ? '#7a5bf7' : '#6b7280'; // Purple if found, gray if not
+  const iconPath = isLoginNotification
+    ? 'icons/rememberme-icon.png'
+    : hasMemories 
+      ? 'icons/RememberMe_Search_Information_Icon.png'
+      : 'icons/RememberMe_Data_Shield_M_Icon.png';
+  const bgColor = isLoginNotification 
+    ? '#7a5bf7'  // Purple for login
+    : hasMemories 
+      ? '#7a5bf7' 
+      : '#6b7280';
   
   // Create notification element
   const notification = document.createElement('div');
@@ -247,11 +279,17 @@ export const showMemoryNotification = (
     gap: 10px;
   `;
   
-  // Set notification text based on whether memories were found
-  const mainText = hasMemories
-    ? `${count} relevant memory${count > 1 ? 'ies' : ''} found`
-    : 'No memories found';
-  const subText = hasMemories ? 'Click to view' : 'Click to search manually';
+  // Set notification text based on whether memories were found or login mode
+  const mainText = isLoginNotification
+    ? 'Sign in to RememberMe'
+    : hasMemories
+      ? `${count} relevant memory${count > 1 ? 'ies' : ''} found`
+      : 'No memories found';
+  const subText = isLoginNotification
+    ? 'Click to sign in and enable memory features'
+    : hasMemories 
+      ? 'Click to view' 
+      : 'Click to search manually';
   
   // Create icon element
   const icon = document.createElement('img');
@@ -312,6 +350,58 @@ export const showMemoryNotification = (
       }, 300);
     }
   }, 5000);
+};
+
+/**
+ * Show a login notification prompting user to sign in
+ * Reuses the memory notification system for consistent UX
+ */
+export const showLoginNotification = (): void => {
+  const openPopupCallback = () => {
+    try {
+      chrome.runtime.sendMessage({ action: SidebarAction.OPEN_POPUP });
+    } catch (error) {
+      console.warn('[RememberMe] Could not open popup:', error);
+    }
+  };
+  
+  // Use count = -1 as special indicator for login mode
+  showMemoryNotification(-1, undefined, openPopupCallback);
+};
+
+/**
+ * Check authentication on page load and show login notification if needed
+ * Includes cooldown to prevent repeated notifications
+ */
+export const checkAuthOnPageLoad = async (): Promise<void> => {
+  try {
+    // Check if we should show notification (cooldown check)
+    const lastShownKey = 'rememberme-login-notification-last-shown';
+    const lastShown = localStorage.getItem(lastShownKey);
+    const now = Date.now();
+    const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+    
+    if (lastShown && (now - parseInt(lastShown)) < COOLDOWN_MS) {
+      return; // Still in cooldown period
+    }
+    
+    // Check if memory is enabled
+    const data = await new Promise<StorageData>(resolve => {
+      chrome.storage.sync.get([StorageKey.MEMORY_ENABLED], resolve);
+    });
+    if (data[StorageKey.MEMORY_ENABLED] === false) {
+      return; // Memory disabled, don't show notification
+    }
+    
+    // Check authentication
+    const hasAuth = await hasValidAuth();
+    if (!hasAuth) {
+      showLoginNotification();
+      localStorage.setItem(lastShownKey, now.toString());
+    }
+  } catch (error) {
+    console.warn('[RememberMe] Error checking auth on page load:', error);
+  }
 };
 
 /**

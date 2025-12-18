@@ -16,6 +16,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
@@ -345,7 +346,12 @@ function setInputValue(inputElement: HTMLTextAreaElement | null, value: string):
 
 function initializeMem0Integration(): void {
   setupInputObserver();
-  hookGrokBackgroundSearchTyping(); 
+  hookGrokBackgroundSearchTyping();
+  
+  // Check auth on page load
+  setTimeout(() => {
+    checkAuthOnPageLoad();
+  }, 1000); 
 
   // COMMENTED OUT: Icon button injection - using notification-only approach
   // COMMENTED OUT: Icon button injection - using notification-only approach

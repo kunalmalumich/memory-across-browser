@@ -75,6 +75,32 @@ export async function refreshSupabaseSession(): Promise<boolean> {
     });
     
     if (error || !data.session) {
+      // Check if refresh token was already used (race condition)
+      const errorMessage = error?.message || '';
+      const isAlreadyUsed = 
+        errorMessage.includes('Already Used') || 
+        errorMessage.includes('Invalid Refresh Token') ||
+        (error as any)?.status === 400;
+      
+      if (isAlreadyUsed) {
+        console.warn('[Auth] Refresh token was already used (likely due to concurrent refresh), clearing session');
+        // Clear session storage without calling signOut (session is already invalid)
+        await chrome.storage.sync.remove([
+          StorageKey.SUPABASE_USER_ID,
+          StorageKey.SUPABASE_USER_EMAIL,
+          StorageKey.SUPABASE_ACCESS_TOKEN,
+          StorageKey.SUPABASE_REFRESH_TOKEN,
+          StorageKey.SUPABASE_SESSION_EXPIRES_AT
+        ]);
+        
+        // Broadcast logout event so UI can update
+        chrome.runtime.sendMessage({ action: 'AUTH_LOGOUT' }).catch(() => {
+          // Ignore if no listeners
+        });
+        
+        return false;
+      }
+      
       console.error('[Auth] Session refresh failed:', error);
       return false;
     }

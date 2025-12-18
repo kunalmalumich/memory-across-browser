@@ -16,6 +16,7 @@ import {
   getOrgId,
   getProjectId,
   getApiKey,
+  checkAuthOnPageLoad,
 } from '../utils/util_functions';
 import { REMEMBERME_UI, type Placement } from '../utils/util_positioning';
 
@@ -432,6 +433,11 @@ function initializeMem0Integration(): void {
       // Add keyboard event listeners
       addKeyboardListeners();
 
+      // Check auth on page load
+      setTimeout(() => {
+        checkAuthOnPageLoad();
+      }, 1000);
+      
       // Add send button listener (non-blocking)
       setTimeout(() => {
         try {

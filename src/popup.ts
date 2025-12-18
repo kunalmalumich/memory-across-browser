@@ -9,6 +9,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const successMessage = document.getElementById('successMessage') as HTMLDivElement;
   const googleSignInButton = document.getElementById('googleSignInButton') as HTMLButtonElement;
 
+  // Set logo images using chrome.runtime.getURL()
+  const popupLogo = document.getElementById('popupLogo') as HTMLImageElement;
+  const legacyButtonLogo = document.getElementById('legacyButtonLogo') as HTMLImageElement;
+  if (popupLogo && chrome?.runtime?.getURL) {
+    popupLogo.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+  }
+  if (legacyButtonLogo && chrome?.runtime?.getURL) {
+    legacyButtonLogo.src = chrome.runtime.getURL('icons/rememberme-icon.png');
+  }
+
   // Check if already authenticated
   checkAuthStatus();
 
@@ -32,7 +42,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       try {
         // Use web-hosted redirect URL to avoid Chrome blocking chrome-extension:// URLs
-        const redirectUrl = 'https://88beefbb-a85b-495b-b4e7-2f1d417e9429-00-3ljhlrdf9fxc.spock.replit.dev/auth-callback';
+        const redirectUrl = 'https://memorykeeper.replit.app/auth-callback';
 
         // Request Magic Link
         const { data, error } = await supabase.auth.signInWithOtp({
